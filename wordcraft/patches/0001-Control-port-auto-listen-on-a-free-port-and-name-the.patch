@@ -1,0 +1,191 @@
+From 065754c569a4e14dfc6debbe5a0cb8a6db4095cd Mon Sep 17 00:00:00 2001
+From: Lovelace's Square <noreply@lovelacesquare.org>
+Date: Sun, 18 Oct 2026 09:52:13 +0200
+Subject: [PATCH 1/3] Control port `auto`: listen on a free port and name the
+ key file after it
+
+`--control auto` (or WORDCRAFT_CONTROL_PORT=auto; `0` means the same)
+binds 127.0.0.1:0, so the system picks a free port, and the key file is
+written for the port actually bound (control-key.local-<port>). Any
+number of windows can then be started with a control channel without
+choosing ports, and a client finds each window, and its port, by listing
+the key files. Before, `0` bound a free port but wrote
+control-key.local-0, which no client could match to the port.
+
+- wordcraft: control_server::parse_port (a port number or `auto`, any
+  case) for --control and WORDCRAFT_CONTROL_PORT; start() reads the bound
+  port back from the listener for the key file and the log.
+- docs: control-protocol.md describes `auto` and the key file name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Esdp3ZTPsHBV41yHxMJHnJ
+---
+ apps/wordcraft/src/control_server.rs | 70 ++++++++++++++++++++++++++--
+ apps/wordcraft/src/main.rs           |  9 ++--
+ docs/control-protocol.md             |  9 ++--
+ 3 files changed, 78 insertions(+), 10 deletions(-)
+
+diff --git a/apps/wordcraft/src/control_server.rs b/apps/wordcraft/src/control_server.rs
+index 54828d5..e9681bc 100644
+--- a/apps/wordcraft/src/control_server.rs
++++ b/apps/wordcraft/src/control_server.rs
+@@ -4,6 +4,10 @@
+ //! Every request needs the window's key (`docs/control-protocol.md`, Keys): once the port is
+ //! bound, the app writes a random key to `<settings>/control-key.<instance>` (mode 0600) and
+ //! removes the file when the window closes.
++//!
++//! The port may be `auto` (`--control auto`): the system picks a free one, and the key file is
++//! named after the port the window got, so a client finds every open window by listing the key
++//! files.
+ 
+ use std::io::{BufRead, BufReader, Read, Write};
+ use std::net::{TcpListener, TcpStream};
+@@ -33,9 +37,20 @@ impl KeyFile {
+     }
+ }
+ 
+-/// Bind `127.0.0.1:port`, write the key file into `settings` and serve. `None` when the port
+-/// cannot be bound or there is no random key (the control channel is off); the key file is
+-/// `None` when it could not be written (requests are then refused).
++/// The port `auto` asks for: any free one.
++pub const AUTO: u16 = 0;
++
++/// A `--control` or `WORDCRAFT_CONTROL_PORT` value: a port number, or `auto` (any letter case)
++/// for a free port the system picks, which is also what `0` means. `None` for anything else.
++pub fn parse_port(s: &str) -> Option<u16> {
++    let s = s.trim();
++    if s.eq_ignore_ascii_case("auto") { Some(AUTO) } else { s.parse().ok() }
++}
++
++/// Bind `127.0.0.1:port` ([`AUTO`]: a free port), write the key file for the port bound into
++/// `settings` and serve. `None` when the port cannot be bound or there is no random key (the
++/// control channel is off); the key file is `None` when it could not be written (requests are
++/// then refused).
+ pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>) -> Option<(Receiver<ControlRequest>, Option<KeyFile>)> {
+     let listener = match TcpListener::bind(("127.0.0.1", port)) {
+         Ok(l) => l,
+@@ -44,6 +59,14 @@ pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>) -> Option<(
+             return None;
+         }
+     };
++    // With `auto`, the port the system picked: the key file and the log name that one.
++    let port = match listener.local_addr() {
++        Ok(a) => a.port(),
++        Err(e) => {
++            log::error!("control server off: no local address ({e})");
++            return None;
++        }
++    };
+     let key = match random_key() {
+         Ok(k) => k,
+         Err(e) => {
+@@ -503,6 +526,47 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn auto_or_a_port_number() {
++        assert_eq!(parse_port("7981"), Some(7981));
++        assert_eq!(parse_port(" 7981\n"), Some(7981));
++        for auto in ["auto", "AUTO", "Auto", " auto ", "0"] {
++            assert_eq!(parse_port(auto), Some(AUTO), "{auto:?}");
++        }
++        for junk in ["", "automatic", "-1", "65536", "7981x", "0x1f"] {
++            assert_eq!(parse_port(junk), None, "{junk:?}");
++        }
++    }
++
++    /// `auto` binds a free port, and the key file is named after that port, so a client lists
++    /// the key files to find the windows and the port to connect to.
++    #[test]
++    fn auto_names_the_key_file_after_the_port_it_got() {
++        let dir = temp_dir("auto");
++        let (rx, key_file) = start(AUTO, egui::Context::default(), Some(&dir)).unwrap();
++        let key_file = key_file.unwrap();
++        if wordcraft_control_key::instance_id().is_none() {
++            let name = key_file.path().file_name().unwrap().to_str().unwrap();
++            let port: u16 = name.strip_prefix("control-key.local-").unwrap().parse().unwrap();
++            assert_ne!(port, AUTO, "the real port, not 0");
++            assert_eq!(key_file.path(), wordcraft_control_key::key_path(&dir, port));
++            let key = std::fs::read_to_string(key_file.path()).unwrap();
++            let mut c = Conn::open(port);
++            c.send(&format!(r#"{{"id":1,"key":"{key}","method":"document.inspect"}}"#));
++            answer(&rx);
++            assert_eq!(c.recv()["ok"], true);
++        }
++        // Two windows started with `auto` get two ports and two key files.
++        let (_rx2, other) = start(AUTO, egui::Context::default(), Some(&dir)).unwrap();
++        let other = other.unwrap();
++        if wordcraft_control_key::instance_id().is_none() {
++            assert_ne!(other.path(), key_file.path());
++        }
++        key_file.remove();
++        other.remove();
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn a_stale_key_file_is_replaced() {
+         let dir = temp_dir("stale");
+diff --git a/apps/wordcraft/src/main.rs b/apps/wordcraft/src/main.rs
+index 62b51d4..62d8e35 100644
+--- a/apps/wordcraft/src/main.rs
++++ b/apps/wordcraft/src/main.rs
+@@ -1,8 +1,9 @@
+ //! WordCraft desktop app.
+ //!
+-//! Usage: `wordcraft [--control <port>] [--sample] [files…]`
++//! Usage: `wordcraft [--control <port>|auto] [--sample] [files…]`
+ //!
+-//! `--control <port>` (or `WORDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server:
++//! `--control <port>` (or `WORDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server
++//! (`auto`: on a free port, named in the key file's name):
+ //! `{"id":1,"key":"…","method":"engine.execute","params":{"command":"text.insert","params":{"text":"Hi"}}}`.
+ //! Every request needs the key the app writes to `<settings>/control-key.<instance>` (mode 0600,
+ //! removed on exit). See `docs/control-protocol.md`.
+@@ -237,13 +238,13 @@ fn main() -> eframe::Result {
+     // First, so the panic hook and every start-up warning are recorded (`logging`).
+     let logger = logging::install();
+     logging::install_panic_hook();
+-    let mut control_port: Option<u16> = std::env::var("WORDCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
++    let mut control_port: Option<u16> = std::env::var("WORDCRAFT_CONTROL_PORT").ok().and_then(|p| control_server::parse_port(&p));
+     let mut files = Vec::new();
+     let mut sample = false;
+     let mut args = std::env::args().skip(1);
+     while let Some(a) = args.next() {
+         match a.as_str() {
+-            "--control" => control_port = args.next().and_then(|p| p.parse().ok()),
++            "--control" => control_port = args.next().and_then(|p| control_server::parse_port(&p)),
+             "--sample" => sample = true,
+             "--version" => {
+                 println!("wordcraft {} ({})", env!("CARGO_PKG_VERSION"), build_sha());
+diff --git a/docs/control-protocol.md b/docs/control-protocol.md
+index 4ca1efb..463c52e 100644
+--- a/docs/control-protocol.md
++++ b/docs/control-protocol.md
+@@ -1,8 +1,10 @@
+ # Control protocol
+ 
+ Start the app with a control port: `wordcraft --control 7981` (or `WORDCRAFT_CONTROL_PORT=7981`).
+-It listens on `127.0.0.1` only. Send one JSON object per line, with the window's key (see
+-[Keys](#keys)); each gets one reply line:
++`--control auto` (or `WORDCRAFT_CONTROL_PORT=auto`) takes any free port; the window's key file
++is named after the port it got (see [Keys](#keys)), so a client finds every open window, and its
++port, by listing the key files. It listens on `127.0.0.1` only. Send one JSON object per line,
++with the window's key (see [Keys](#keys)); each gets one reply line:
+ 
+ ```json
+ {"id": 1, "key": "…", "method": "engine.execute", "params": {"command": "text.insert", "params": {"text": "Hello"}}}
+@@ -21,7 +23,8 @@ window's key. Once the port is bound, the app writes a random key (256 bits, as
+ writes a new key. `<settings>` is the folder that holds the preferences: on Linux
+ `$XDG_CONFIG_HOME/wordcraft` (by default `~/.config/wordcraft`), on macOS
+ `~/Library/Application Support/WordCraft`, on Windows `%APPDATA%\WordCraft`. `<instance>` is the
+-Flatpak instance id inside Flatpak, and `local-<port>` otherwise. On Unix the file has mode 0600.
++Flatpak instance id inside Flatpak, and `local-<port>` otherwise, with the port the window is
++listening on (also with `auto`). On Unix the file has mode 0600.
+ 
+ ```sh
+ cat ~/.config/wordcraft/control-key.local-7981   # Linux, outside Flatpak, port 7981
+-- 
+2.52.0.windows.1
+

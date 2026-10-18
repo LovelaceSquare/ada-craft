@@ -1,0 +1,5 @@
+{
+  "wordcraft": { "repo": "https://github.com/storytold/wordcraft", "tag": "v0.7.0", "commit": "fc41918814f62645b6746ed68e71e8c2c2e85d6f", "packages": ["wordcraft", "wordcraft-cli"] },
+  "gridcraft": { "repo": "https://github.com/storytold/gridcraft", "tag": "v0.7.0", "commit": "d9d09f0baa912e88c5111107903fc8c640214b57", "packages": ["gridcraft", "gridcraft-cli"] },
+  "deckcraft": { "repo": "https://github.com/storytold/deckcraft", "tag": "v0.7.0", "commit": "d78e657e4cb1e490ceb5445785c052d9cf5ad963", "packages": ["deckcraft", "deckcraft-cli"] }
+}

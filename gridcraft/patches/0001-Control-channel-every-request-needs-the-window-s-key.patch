@@ -1,0 +1,1410 @@
+From e28c92e21be07332b0c5b04d96f08ec3da3548aa Mon Sep 17 00:00:00 2001
+From: Lovelace's Square <noreply@lovelacesquare.org>
+Date: Sun, 18 Oct 2026 10:28:12 +0200
+Subject: [PATCH 1/5] Control channel: every request needs the window's key
+
+Any local program, and possibly a web page, can reach a loopback port, and
+GridCraft's control channel ran any command for anyone who connected.
+This brings over WordCraft's key scheme (docs/control-protocol.md, Keys):
+
+- gridcraft-control-key (new, L0): the settings folder and the key file's
+  name, control-key.local-<port> (or the Flatpak instance id), shared by
+  the app and the MCP bridge. The app's config_dir is now this folder.
+- gridcraft: once the port is bound, the control server writes a random
+  256-bit key (getrandom) to the key file (mode 0600 on Unix, a stale
+  file replaced) and the window removes it on exit. Every request needs
+  the key, as top-level `key` or once per connection with `auth`
+  (compared in constant time); a missing or wrong key gets
+  `unauthorized` and the connection is closed. A connection without an
+  authorised request is closed after 30 s (one deadline: blank lines and
+  bad JSON don't extend it); a line that isn't JSON closes the connection
+  (an HTTP request can't smuggle a command); a line over 64 MiB is
+  refused and closes it. Without a settings folder or key file, requests
+  are refused.
+- mcp: Remote (`gridcraft-cli mcp --connect`, `send`) takes the key from
+  GRIDCRAFT_CONTROL_KEY or the key file for the port, reads it again on
+  every new connection (and once more after an `unauthorized`, for an
+  app that restarted), and sends it only to loopback addresses, with a
+  clear error otherwise.
+- docs: control-protocol.md Keys; mcp.md.
+
+Tests ported from WordCraft for the server (refusals, auth, deadline,
+line limit, HTTP smuggling, key file life), the key file name and the
+bridge (env then file, loopback only, re-read after a restart).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Esdp3ZTPsHBV41yHxMJHnJ
+---
+ Cargo.lock                           |   7 +
+ Cargo.toml                           |   3 +
+ apps/gridcraft/Cargo.toml            |   4 +
+ apps/gridcraft/src/control_server.rs | 536 +++++++++++++++++++++++++--
+ apps/gridcraft/src/main.rs           |  50 +--
+ crates/control-key/Cargo.toml        |   9 +
+ crates/control-key/src/lib.rs        |  85 +++++
+ crates/mcp/Cargo.toml                |   2 +
+ crates/mcp/src/backend.rs            | 319 +++++++++++++++-
+ crates/mcp/src/tests.rs              |   3 +-
+ docs/control-protocol.md             |  42 ++-
+ docs/mcp.md                          |   4 +
+ xtask/src/layers.rs                  |   1 +
+ 13 files changed, 983 insertions(+), 82 deletions(-)
+ create mode 100644 crates/control-key/Cargo.toml
+ create mode 100644 crates/control-key/src/lib.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 6d618a0..34033cf 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1503,6 +1503,8 @@ dependencies = [
+  "eframe",
+  "egui",
+  "fmv-macos-events",
++ "getrandom 0.3.4",
++ "gridcraft-control-key",
+  "gridcraft-engine",
+  "gridcraft-ui-egui",
+  "image",
+@@ -1551,6 +1553,10 @@ dependencies = [
+  "zip",
+ ]
+ 
++[[package]]
++name = "gridcraft-control-key"
++version = "0.7.0"
++
+ [[package]]
+ name = "gridcraft-core"
+ version = "0.7.0"
+@@ -1603,6 +1609,7 @@ dependencies = [
+ name = "gridcraft-mcp"
+ version = "0.7.0"
+ dependencies = [
++ "gridcraft-control-key",
+  "gridcraft-engine",
+  "log",
+  "serde_json",
+diff --git a/Cargo.toml b/Cargo.toml
+index 98dd572..692b35c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,12 +24,15 @@ gridcraft-engine = { path = "crates/engine" }
+ gridcraft-ui-egui = { path = "crates/ui-egui" }
+ gridcraft-mcp = { path = "crates/mcp" }
+ gridcraft-pdf = { path = "crates/pdf" }
++gridcraft-control-key = { path = "crates/control-key" }
+ 
+ # foundation
+ thiserror = "2"
+ serde = { version = "1", features = ["derive", "rc"] }
+ serde_json = { version = "1", features = ["float_roundtrip"] }
+ log = "0.4"
++# The control server's random key.
++getrandom = "0.3"
+ rayon = "1"
+ regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
+ quick-xml = "0.41"
+diff --git a/apps/gridcraft/Cargo.toml b/apps/gridcraft/Cargo.toml
+index cd8311b..1b7f74b 100644
+--- a/apps/gridcraft/Cargo.toml
++++ b/apps/gridcraft/Cargo.toml
+@@ -13,6 +13,8 @@ workspace = true
+ [dependencies]
+ gridcraft-engine = { workspace = true }
+ gridcraft-ui-egui = { workspace = true }
++# The control key file's location (shared with the MCP bridge).
++gridcraft-control-key = { workspace = true }
+ eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }
+ egui = { workspace = true }
+ serde_json = { workspace = true }
+@@ -27,6 +29,8 @@ winresource = "0.1"
+ craft-print = { git = "https://github.com/storytold/craft-libs", rev = "d27646a5f7c8b4fc85d9dd3213b8c88b58e0088d" }
+ rfd = { workspace = true }
+ arboard = { workspace = true }
++# The control server's random key.
++getrandom = { workspace = true }
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+ arboard = { workspace = true, features = ["wayland-data-control"] }
+diff --git a/apps/gridcraft/src/control_server.rs b/apps/gridcraft/src/control_server.rs
+index e9e05a2..6be4121 100644
+--- a/apps/gridcraft/src/control_server.rs
++++ b/apps/gridcraft/src/control_server.rs
+@@ -1,67 +1,529 @@
+-//! Localhost JSON-lines control server. Each connection may send many requests; each line
+-//! `{"id":…, "method":…, "params":…}` gets one reply line `{"id":…, "ok":…, …}`.
++//! Loopback JSON-lines control server: one request per line, one reply per line.
++//! This is the transport the MCP server (`gridcraft-cli mcp --connect`) wraps.
++//!
++//! Every request needs the window's key (`docs/control-protocol.md`, Keys): once the port is
++//! bound, the app writes a random key to `<settings>/control-key.<instance>` (mode 0600) and
++//! removes the file when the window closes.
+ 
+-use std::io::{BufRead, BufReader, Write};
++use std::io::{BufRead, BufReader, Read, Write};
+ use std::net::{TcpListener, TcpStream};
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
+ use std::sync::mpsc::{Receiver, Sender, channel};
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ use gridcraft_ui_egui::ControlRequest;
+-use serde_json::{Value as Json, json};
++use serde_json::{Value, json};
+ 
++/// Longer request lines are refused (and the connection closed). Large enough for a
++/// `range.setValues` with a big block of cells.
+ const MAX_LINE: usize = 64 * 1024 * 1024;
+ 
+-pub fn start(port: u16, ctx: egui::Context) -> std::io::Result<Receiver<ControlRequest>> {
+-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+-    let (tx, rx) = channel();
+-    std::thread::Builder::new().name("control".into()).spawn(move || {
++/// A connection that sends no authorised request in this time is closed.
++const FIRST_REQUEST: Duration = Duration::from_secs(30);
++
++/// The key file of a running control server; [`KeyFile::remove`] it when the window closes.
++pub struct KeyFile(PathBuf);
++
++impl KeyFile {
++    pub fn path(&self) -> &Path {
++        &self.0
++    }
++    pub fn remove(&self) {
++        let _ = std::fs::remove_file(&self.0);
++    }
++}
++
++/// Bind `127.0.0.1:port`, write the key file into `settings` and serve. `None` when the port
++/// cannot be bound or there is no random key (the control channel is off); the key file is
++/// `None` when it could not be written (requests are then refused).
++pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>) -> Option<(Receiver<ControlRequest>, Option<KeyFile>)> {
++    let listener = match TcpListener::bind(("127.0.0.1", port)) {
++        Ok(l) => l,
++        Err(e) => {
++            log::error!("control server failed to bind 127.0.0.1:{port}: {e}");
++            return None;
++        }
++    };
++    let key = match random_key() {
++        Ok(k) => k,
++        Err(e) => {
++            log::error!("control server off: no random key ({e})");
++            return None;
++        }
++    };
++    let key_file = match settings {
++        Some(dir) => {
++            let p = gridcraft_control_key::key_path(dir, port);
++            match write_key_file(&p, &key) {
++                Ok(()) => Some(KeyFile(p)),
++                Err(e) => {
++                    log::error!("control key file not written ({e}): requests will be refused");
++                    None
++                }
++            }
++        }
++        None => {
++            log::error!("no settings folder for the control key file: requests will be refused");
++            None
++        }
++    };
++    match &key_file {
++        Some(f) => log::info!("control server listening on 127.0.0.1:{port}, key in {}", f.path().display()),
++        None => log::info!("control server listening on 127.0.0.1:{port}"),
++    }
++    Some((serve_on(listener, ctx, key, FIRST_REQUEST), key_file))
++}
++
++/// A new key: 32 random bytes from the operating system, as hex.
++fn random_key() -> Result<String, String> {
++    let mut b = [0u8; 32];
++    getrandom::fill(&mut b).map_err(|e| e.to_string())?;
++    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
++}
++
++/// Write the key file: a stale one (from a run that did not exit cleanly) is replaced; on Unix
++/// the new file is created with mode 0600.
++fn write_key_file(p: &Path, key: &str) -> Result<(), String> {
++    if let Some(d) = p.parent() {
++        std::fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
++    }
++    let _ = std::fs::remove_file(p);
++    let mut open = std::fs::OpenOptions::new();
++    open.write(true).create_new(true);
++    #[cfg(unix)]
++    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
++    let mut f = open.open(p).map_err(|e| format!("cannot create {}: {e}", p.display()))?;
++    f.write_all(key.as_bytes()).map_err(|e| format!("cannot write {}: {e}", p.display()))
++}
++
++/// Compare a key with the window's in time that does not depend on where they differ. An
++/// empty key never matches.
++fn keys_match(given: &str, key: &str) -> bool {
++    let (a, b) = (given.as_bytes(), key.as_bytes());
++    !b.is_empty() && a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
++}
++
++fn serve_on(listener: TcpListener, ctx: egui::Context, key: String, first: Duration) -> Receiver<ControlRequest> {
++    let (tx, rx) = channel::<ControlRequest>();
++    let key: Arc<str> = key.into();
++    std::thread::spawn(move || {
+         for stream in listener.incoming().flatten() {
+-            let tx = tx.clone();
+-            let ctx = ctx.clone();
+-            let _ = std::thread::Builder::new().name("control-conn".into()).spawn(move || serve(stream, tx, ctx));
++            let (tx, ctx, key) = (tx.clone(), ctx.clone(), key.clone());
++            std::thread::spawn(move || serve(stream, tx, ctx, &key, first));
+         }
+-    })?;
+-    log::info!("control channel listening on 127.0.0.1:{port}");
+-    Ok(rx)
++    });
++    rx
+ }
+ 
+-fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context) {
++/// The read side of a connection with an optional overall deadline: each read waits only for
++/// the time left, so blank lines, bad JSON or a slow drip of bytes cannot extend it.
++struct Timed {
++    s: TcpStream,
++    deadline: Option<Instant>,
++}
++
++impl Read for Timed {
++    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++        if let Some(d) = self.deadline {
++            let left = d.checked_duration_since(Instant::now()).filter(|l| !l.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
++            self.s.set_read_timeout(Some(left))?;
++        }
++        self.s.read(buf)
++    }
++}
++
++impl Timed {
++    fn set_deadline(&mut self, d: Option<Instant>) {
++        self.deadline = d;
++        if d.is_none() {
++            let _ = self.s.set_read_timeout(None);
++        }
++    }
++}
++
++/// The next line (trimmed), `None` at the end of the stream or after a read error.
++fn read_line(r: &mut BufReader<Timed>) -> Option<Result<String, &'static str>> {
++    let mut buf = Vec::new();
++    let n = r.by_ref().take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf).ok()?;
++    if n == 0 {
++        return None;
++    }
++    if buf.len() > MAX_LINE {
++        return Some(Err("line too long"));
++    }
++    Some(String::from_utf8(buf).map(|s| s.trim().to_string()).map_err(|_| "not UTF-8"))
++}
++
++/// Read and drop the rest of an oversize line, so closing the socket does not reset the
++/// connection before the client has read the error. At most 64 MiB, within 2 s.
++fn discard_rest_of_line(r: &mut BufReader<Timed>) {
++    r.get_mut().set_deadline(Some(Instant::now() + Duration::from_secs(2)));
++    let mut left: usize = 64 << 20;
++    while left > 0 {
++        let (used, done) = match r.fill_buf() {
++            Ok([]) | Err(_) => return,
++            Ok(b) => match b.iter().position(|&c| c == b'\n') {
++                Some(i) => (i + 1, true),
++                None => (b.len(), false),
++            },
++        };
++        r.consume(used);
++        if done {
++            return;
++        }
++        left = left.saturating_sub(used);
++    }
++}
++
++fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key: &str, first: Duration) {
+     let Ok(read) = stream.try_clone() else { return };
+     let mut out = stream;
+-    let reader = BufReader::new(read);
+-    for line in reader.lines() {
+-        let Ok(line) = line else { break };
+-        if line.trim().is_empty() {
+-            continue;
+-        }
+-        if line.len() > MAX_LINE {
+-            let _ = writeln!(out, "{}", json!({"ok": false, "error": "request too large"}));
++    // One overall deadline from accept to the first authorised request; after it, none.
++    let mut reader = BufReader::new(Timed { s: read, deadline: Some(Instant::now() + first) });
++    let mut authorised = false;
++    // The key an `auth` request gave this connection.
++    let mut conn_key: Option<String> = None;
++    while let Some(line) = read_line(&mut reader) {
++        let line = match line {
++            Ok(l) => l,
++            Err(e) => {
++                let _ = writeln!(out, "{}", json!({"ok": false, "error": e}));
++                if e == "line too long" {
++                    discard_rest_of_line(&mut reader);
++                }
++                break;
++            }
++        };
++        if line.is_empty() {
+             continue;
+         }
+-        let msg: Json = match serde_json::from_str(&line) {
+-            Ok(v) => v,
++        let msg = match serde_json::from_str::<Value>(&line) {
++            Ok(m) => m,
++            // Close on a line that isn't JSON: an HTTP request (say, a web page's `fetch` to this
++            // port) starts with a request line that never parses, so it can't carry a command in
++            // its body, even before the key is checked.
+             Err(e) => {
+-                let _ = writeln!(out, "{}", json!({"ok": false, "error": format!("invalid JSON: {e}")}));
+-                continue;
++                let _ = writeln!(out, "{}", json!({"ok": false, "error": format!("bad JSON: {e}; closing the connection")}));
++                break;
+             }
+         };
+-        let id = msg.get("id").cloned().unwrap_or(Json::Null);
+-        let method = msg.get("method").and_then(Json::as_str).unwrap_or("").to_string();
++        let id = msg.get("id").cloned().unwrap_or(Value::Null);
++        let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+         let params = msg.get("params").cloned().unwrap_or(json!({}));
+-        let (req, rx) = ControlRequest::new(method, params);
++        // The top-level `key`; `auth` may carry it in its params. For other methods `params.key`
++        // is an ordinary parameter (`ui.key {"key": "Enter"}`).
++        let given =
++            msg.get("key").and_then(Value::as_str).or_else(|| if method == "auth" { params.get("key").and_then(Value::as_str) } else { None });
++        let mut reply = |mut v: Value| -> bool {
++            if let Some(o) = v.as_object_mut() {
++                o.insert("id".into(), id.clone());
++            }
++            writeln!(out, "{v}").is_ok()
++        };
++        // Checked on every request.
++        let k = given.or(conn_key.as_deref()).unwrap_or("");
++        if !keys_match(k, key) {
++            let _ = reply(json!({"ok": false, "error": "unauthorized"}));
++            break;
++        }
++        if !authorised {
++            authorised = true;
++            reader.get_mut().set_deadline(None);
++        }
++        if method == "auth" {
++            conn_key = Some(k.to_string());
++            if !reply(json!({"ok": true, "result": {}})) {
++                break;
++            }
++            continue;
++        }
++        let (req, rrx) = ControlRequest::new(method, params);
+         if tx.send(req).is_err() {
+             break;
+         }
+-        // Wake the UI thread: egui only runs frames when something happens.
+         ctx.request_repaint();
+-        let mut reply = rx
++        let r = rrx
+             .recv_timeout(Duration::from_secs(60))
+             .unwrap_or_else(|_| json!({"ok": false, "error": "timed out waiting for the UI (is the window minimised?)"}));
+-        if let Some(o) = reply.as_object_mut() {
+-            o.insert("id".into(), id);
+-        }
+-        if writeln!(out, "{reply}").is_err() {
++        if !reply(r) {
+             break;
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::{BufRead, BufReader, Write};
++    use std::net::TcpStream;
++
++    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
++
++    fn boot_with(first: Duration) -> (u16, Receiver<ControlRequest>) {
++        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let port = listener.local_addr().unwrap().port();
++        (port, serve_on(listener, egui::Context::default(), KEY.to_string(), first))
++    }
++
++    fn boot() -> (u16, Receiver<ControlRequest>) {
++        boot_with(FIRST_REQUEST)
++    }
++
++    /// Answer the next request that reaches the UI with `ok`, and return it.
++    fn answer(rx: &Receiver<ControlRequest>) -> ControlRequest {
++        let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
++        let _ = req.reply.send(json!({"ok": true, "result": {}}));
++        req
++    }
++
++    /// One connection, several lines.
++    struct Conn(BufReader<TcpStream>, TcpStream);
++
++    impl Conn {
++        fn open(port: u16) -> Self {
++            let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
++            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
++            Self(BufReader::new(s.try_clone().unwrap()), s)
++        }
++        fn send(&mut self, line: &str) {
++            writeln!(self.1, "{line}").unwrap();
++        }
++        fn recv(&mut self) -> Value {
++            let mut r = String::new();
++            let _ = self.0.read_line(&mut r);
++            serde_json::from_str(&r).unwrap_or_default()
++        }
++        fn call(&mut self, line: &str) -> Value {
++            self.send(line);
++            self.recv()
++        }
++        /// The server closed the connection.
++        fn closed(&mut self) -> bool {
++            let mut r = String::new();
++            matches!(self.0.read_line(&mut r), Ok(0))
++        }
++    }
++
++    #[test]
++    fn a_request_without_the_key_is_refused_and_closed() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        let r = c.call(r#"{"id":1,"method":"document.inspect"}"#);
++        assert_eq!((r["ok"].clone(), r["error"].clone(), r["id"].clone()), (json!(false), json!("unauthorized"), json!(1)));
++        assert!(c.closed());
++        assert!(rx.try_recv().is_err(), "nothing reached the UI");
++    }
++
++    #[test]
++    fn a_wrong_key_is_refused_and_closed() {
++        let (port, rx) = boot();
++        for key in ["nope", &KEY[..63], &format!("{KEY}0"), &KEY.to_uppercase()] {
++            let mut c = Conn::open(port);
++            assert_eq!(c.call(&format!(r#"{{"id":1,"key":"{key}","method":"document.inspect"}}"#))["error"], "unauthorized", "{key}");
++            assert!(c.closed());
++        }
++        assert!(rx.try_recv().is_err());
++    }
++
++    #[test]
++    fn the_key_on_each_request() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        c.send(&format!(r#"{{"id":7,"key":"{KEY}","method":"document.inspect","params":{{"text":true}}}}"#));
++        let req = answer(&rx);
++        assert_eq!((req.method.as_str(), &req.params), ("document.inspect", &json!({"text": true})));
++        let r = c.recv();
++        assert_eq!((r["ok"].clone(), r["id"].clone()), (json!(true), json!(7)));
++        // Every request needs it: one without the key is refused, also after good ones.
++        assert_eq!(c.call(r#"{"id":8,"method":"document.inspect"}"#)["error"], "unauthorized");
++        assert!(c.closed());
++    }
++
++    #[test]
++    fn auth_once_per_connection() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        assert_eq!(c.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
++        for id in 2..4 {
++            c.send(&format!(r#"{{"id":{id},"method":"document.inspect"}}"#));
++            answer(&rx);
++            assert_eq!(c.recv()["ok"], true);
++        }
++        // `params.key` works for `auth` too.
++        let mut c = Conn::open(port);
++        assert_eq!(c.call(&format!(r#"{{"id":1,"method":"auth","params":{{"key":"{KEY}"}}}}"#))["ok"], true);
++        // A wrong key on an authenticated connection is still refused, and closes it.
++        assert_eq!(c.call(r#"{"id":2,"key":"nope","method":"document.inspect"}"#)["error"], "unauthorized");
++        assert!(c.closed());
++        // A failed auth closes the connection.
++        let mut c = Conn::open(port);
++        assert_eq!(c.call(r#"{"id":1,"method":"auth","key":"nope"}"#)["error"], "unauthorized");
++        assert!(c.closed());
++    }
++
++    #[test]
++    fn params_key_is_only_a_secret_for_auth() {
++        let (port, rx) = boot();
++        // `params.key` does not authenticate other methods.
++        let mut c = Conn::open(port);
++        assert_eq!(c.call(&format!(r#"{{"id":1,"method":"document.inspect","params":{{"key":"{KEY}"}}}}"#))["error"], "unauthorized");
++        // It is an ordinary parameter for them (`ui.key` presses a key).
++        let mut c = Conn::open(port);
++        c.send(&format!(r#"{{"id":1,"key":"{KEY}","method":"ui.key","params":{{"key":"Enter"}}}}"#));
++        let req = answer(&rx);
++        assert_eq!((req.method.as_str(), &req.params), ("ui.key", &json!({"key": "Enter"})));
++        assert_eq!(c.recv()["ok"], true);
++    }
++
++    #[test]
++    fn a_line_over_the_limit_is_refused_and_closed() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        let big = format!(r#"{{"id":1,"key":"{KEY}","method":"document.inspect","pad":"{}"}}"#, "x".repeat(MAX_LINE));
++        assert_eq!(c.call(&big)["error"], "line too long");
++        assert!(c.closed());
++        assert!(rx.try_recv().is_err());
++    }
++
++    #[test]
++    fn a_silent_connection_is_closed() {
++        let (port, rx) = boot_with(Duration::from_millis(300));
++        let mut quiet = Conn::open(port);
++        let t0 = Instant::now();
++        assert!(quiet.closed());
++        assert!(t0.elapsed() < Duration::from_secs(3));
++        // After an authorised request the connection may stay idle.
++        let mut busy = Conn::open(port);
++        assert_eq!(busy.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
++        std::thread::sleep(Duration::from_millis(600));
++        busy.send(r#"{"id":2,"method":"document.inspect"}"#);
++        answer(&rx);
++        assert_eq!(busy.recv()["ok"], true);
++    }
++
++    #[test]
++    fn the_first_request_limit_is_one_overall_deadline() {
++        // Blank lines and bad JSON do not keep a connection without the key open.
++        let (port, _rx) = boot_with(Duration::from_millis(300));
++        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
++        let mut w = s.try_clone().unwrap();
++        let feeder = std::thread::spawn(move || {
++            for i in 0..40 {
++                if w.write_all(if i % 2 == 0 { b"\n" } else { b"not json\n" }).is_err() {
++                    return;
++                }
++                std::thread::sleep(Duration::from_millis(50));
++            }
++        });
++        let t0 = Instant::now();
++        let mut r = BufReader::new(s);
++        r.get_ref().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
++        let mut line = String::new();
++        loop {
++            line.clear();
++            if matches!(r.read_line(&mut line), Ok(0) | Err(_)) {
++                break;
++            }
++            assert!(line.contains("bad JSON"), "{line}");
++        }
++        let _ = feeder.join();
++        assert!(t0.elapsed() < Duration::from_millis(1500), "{:?}", t0.elapsed());
++    }
++
++    #[test]
++    fn bad_json_closes_the_connection() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        assert_eq!(c.call("not json")["ok"], false);
++        assert!(c.closed());
++        assert!(rx.try_recv().is_err());
++    }
++
++    #[test]
++    fn http_request_cannot_smuggle_a_command() {
++        // What a web page's `fetch("http://127.0.0.1:<port>/", {method: "POST", body})` sends,
++        // even with the key in the body.
++        let (port, rx) = boot();
++        let body = format!("\n{{\"key\":\"{KEY}\",\"method\":\"file.saveAs\",\"params\":{{\"path\":\"/tmp/x.docx\"}}}}\n");
++        let req = format!("POST / HTTP/1.1\r\nHost: 127.0.0.1:7979\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}", body.len());
++        let mut c = Conn::open(port);
++        c.1.write_all(req.as_bytes()).unwrap();
++        let _ = c.recv();
++        assert!(c.closed());
++        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
++    }
++
++    #[test]
++    fn keys_compare_whole() {
++        assert!(keys_match(KEY, KEY));
++        assert!(!keys_match(KEY, &KEY[..63]));
++        assert!(!keys_match(&KEY[..63], KEY));
++        assert!(!keys_match(KEY, &KEY.replace('f', "e")));
++        assert!(!keys_match("", ""), "an empty key never matches");
++    }
++
++    #[test]
++    fn random_keys_are_256_bits() {
++        let (a, b) = (random_key().unwrap(), random_key().unwrap());
++        assert_eq!(a.len(), 64);
++        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
++        assert_ne!(a, b);
++    }
++
++    fn temp_dir(name: &str) -> std::path::PathBuf {
++        let dir = std::env::temp_dir().join(format!("gridcraft-control-{name}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        dir
++    }
++
++    #[test]
++    fn the_key_file_is_written_after_the_bind_and_removed_on_exit() {
++        let dir = temp_dir("life");
++        // The port is taken: no key file.
++        let taken = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let port = taken.local_addr().unwrap().port();
++        assert!(start(port, egui::Context::default(), Some(&dir)).is_none());
++        assert!(!dir.exists() || std::fs::read_dir(&dir).unwrap().next().is_none(), "no key file after a failed bind");
++        drop(taken);
++        // Bound: the key file holds the key that opens the port.
++        let (rx, key_file) = start(port, egui::Context::default(), Some(&dir)).unwrap();
++        let key_file = key_file.unwrap();
++        assert_eq!(key_file.path(), gridcraft_control_key::key_path(&dir, port));
++        let key = std::fs::read_to_string(key_file.path()).unwrap();
++        assert_eq!(key.len(), 64);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            assert_eq!(std::fs::metadata(key_file.path()).unwrap().permissions().mode() & 0o777, 0o600);
++        }
++        let mut c = Conn::open(port);
++        c.send(&format!(r#"{{"id":1,"key":"{key}","method":"document.inspect"}}"#));
++        answer(&rx);
++        assert_eq!(c.recv()["ok"], true);
++        key_file.remove();
++        assert!(!key_file.path().exists());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn a_stale_key_file_is_replaced() {
++        let dir = temp_dir("stale");
++        std::fs::create_dir_all(&dir).unwrap();
++        let p = dir.join("control-key.test");
++        std::fs::write(&p, "old").unwrap();
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
++        }
++        write_key_file(&p, KEY).unwrap();
++        assert_eq!(std::fs::read_to_string(&p).unwrap(), KEY);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
++        }
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}
+diff --git a/apps/gridcraft/src/main.rs b/apps/gridcraft/src/main.rs
+index 7c0eb04..d660eab 100644
+--- a/apps/gridcraft/src/main.rs
++++ b/apps/gridcraft/src/main.rs
+@@ -3,8 +3,9 @@
+ //! Usage: `gridcraft [--control <port>] [--sample <name>] [files…]`
+ //!
+ //! `--control <port>` (or `GRIDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control
+-//! server: `{"id":1,"method":"ui.inspect","params":{}}` → `{"id":1,"ok":true,"result":…}`.
+-//! See `gridcraft_ui_egui::control` and `docs/control-protocol.md` for the methods.
++//! server: `{"id":1,"key":"…","method":"ui.inspect","params":{}}` → `{"id":1,"ok":true,"result":…}`.
++//! Every request needs the key the app writes to `<settings>/control-key.<instance>` (mode 0600,
++//! removed on exit). See `gridcraft_ui_egui::control` and `docs/control-protocol.md`.
+ #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+ #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+ 
+@@ -25,19 +26,26 @@ use gridcraft_engine::Session;
+ use gridcraft_ui_egui::{Services, SheetApp};
+ use serde_json::json;
+ 
+-struct App(SheetApp, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>, #[cfg(target_os = "macos")] fmv_macos_events::Inbox);
++/// The app, the control server's key file (removed on exit) and, on macOS, the native menu and
++/// the documents opened from Finder.
++struct App(
++    SheetApp,
++    Option<control_server::KeyFile>,
++    #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>,
++    #[cfg(target_os = "macos")] fmv_macos_events::Inbox,
++);
+ 
+ impl eframe::App for App {
+     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+         #[cfg(target_os = "macos")]
+         {
+-            if self.1.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
+-                self.1 = Some(native_menu::NativeMenu::install(ctx));
++            if self.2.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
++                self.2 = Some(native_menu::NativeMenu::install(ctx));
+             }
+-            if let Some(m) = &self.1 {
++            if let Some(m) = &self.2 {
+                 m.poll(&mut self.0, ctx);
+             }
+-            apple_events::poll(&self.2, &mut self.0, ctx);
++            apple_events::poll(&self.3, &mut self.0, ctx);
+         }
+         self.0.logic(ctx);
+         self.0.poll_printing(ctx);
+@@ -60,6 +68,9 @@ impl eframe::App for App {
+     fn on_exit(&mut self) {
+         print::finish_pending_jobs();
+         save_prefs(&self.0);
++        if let Some(key_file) = &self.1 {
++            key_file.remove();
++        }
+         // macOS (#117): end the process here, before eframe tears the window down. AccessKit's
+         // macOS adapter subclasses the window's content view and restores its class on teardown;
+         // AppKit's Touch Bar support observes that view (KVO), so in the next display cycle
+@@ -73,17 +84,10 @@ impl eframe::App for App {
+     }
+ }
+ 
++/// The settings folder (`ui.json`, `prefs.json`, logs), which also holds the control key files
++/// the MCP bridge reads.
+ fn config_dir() -> Option<std::path::PathBuf> {
+-    if cfg!(target_os = "macos") {
+-        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library/Application Support/GridCraft"))
+-    } else if cfg!(windows) {
+-        std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("GridCraft"))
+-    } else {
+-        std::env::var_os("XDG_CONFIG_HOME")
+-            .map(std::path::PathBuf::from)
+-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+-            .map(|c| c.join("gridcraft"))
+-    }
++    gridcraft_control_key::settings_dir()
+ }
+ 
+ /// Runs without preferences (`GRIDCRAFT_NO_PREFS`, agents' test runs) neither read nor write
+@@ -351,14 +355,16 @@ fn main() -> eframe::Result<()> {
+                     return Err("the app was already created".into());
+                 };
+                 SheetApp::setup_context_for_language(&cc.egui_ctx, app.ui.dark, app.ui.language);
+-                if let Some(port) = control_port {
+-                    match control_server::start(port, cc.egui_ctx.clone()) {
+-                        Ok(rx) => app.control_rx = Some(rx),
+-                        Err(e) => log::error!("control channel on port {port}: {e}"),
+-                    }
++                let mut key_file = None;
++                if let Some(port) = control_port
++                    && let Some((rx, file)) = control_server::start(port, cc.egui_ctx.clone(), config_dir().as_deref())
++                {
++                    app.control_rx = Some(rx);
++                    key_file = file;
+                 }
+                 Ok(Box::new(App(
+                     app,
++                    key_file,
+                     #[cfg(target_os = "macos")]
+                     None,
+                     #[cfg(target_os = "macos")]
+diff --git a/crates/control-key/Cargo.toml b/crates/control-key/Cargo.toml
+new file mode 100644
+index 0000000..592ea76
+--- /dev/null
++++ b/crates/control-key/Cargo.toml
+@@ -0,0 +1,9 @@
++[package]
++name = "gridcraft-control-key"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++description = "GridCraft control-port key file: where it lives and how to read it (shared by the app and the MCP bridge)"
++
++[lints]
++workspace = true
+diff --git a/crates/control-key/src/lib.rs b/crates/control-key/src/lib.rs
+new file mode 100644
+index 0000000..1969ae1
+--- /dev/null
++++ b/crates/control-key/src/lib.rs
+@@ -0,0 +1,85 @@
++//! The control channel's key file, one rule for the app (which writes it) and the MCP bridge
++//! (which reads it): `<settings>/control-key.<instance>`. See `docs/control-protocol.md`, Keys.
++#![forbid(unsafe_code)]
++
++use std::path::{Path, PathBuf};
++
++/// The app's settings folder (`ui.json`, `prefs.json`, logs, key files): macOS
++/// `~/Library/Application Support/GridCraft`, Windows `%APPDATA%\GridCraft`, otherwise
++/// `$XDG_CONFIG_HOME/gridcraft` or `~/.config/gridcraft`.
++pub fn settings_dir() -> Option<PathBuf> {
++    if cfg!(target_os = "macos") {
++        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/GridCraft"))
++    } else if cfg!(windows) {
++        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("GridCraft"))
++    } else {
++        std::env::var_os("XDG_CONFIG_HOME")
++            .map(PathBuf::from)
++            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
++            .map(|c| c.join("gridcraft"))
++    }
++}
++
++/// The `instance-id=` value of a `/.flatpak-info` file, only when it is `[A-Za-z0-9_-]+` (it
++/// becomes part of a file name).
++pub fn parse_instance_id(info: &str) -> Option<String> {
++    let v = info.lines().find_map(|l| l.strip_prefix("instance-id="))?.trim();
++    (!v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')).then(|| v.to_string())
++}
++
++/// The Flatpak instance id, or `None` outside Flatpak.
++pub fn instance_id() -> Option<String> {
++    parse_instance_id(&std::fs::read_to_string("/.flatpak-info").ok()?)
++}
++
++/// `<settings>/control-key.<instance>`, with `<instance>` the Flatpak instance id or
++/// `local-<port>`.
++pub fn key_path(settings: &Path, port: u16) -> PathBuf {
++    key_path_for(settings, instance_id().as_deref(), port)
++}
++
++fn key_path_for(settings: &Path, instance: Option<&str>, port: u16) -> PathBuf {
++    match instance {
++        Some(id) => settings.join(format!("control-key.{id}")),
++        None => settings.join(format!("control-key.local-{port}")),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    #![allow(clippy::unwrap_used)]
++    use super::*;
++    use std::path::Path;
++
++    #[test]
++    fn instance_id_only_safe_values() {
++        assert_eq!(parse_instance_id("[Instance]\ninstance-id=abc_123-X\n").as_deref(), Some("abc_123-X"));
++        assert_eq!(parse_instance_id("instance-id= 42 \n").as_deref(), Some("42"));
++        // It ends up in a file name.
++        assert_eq!(parse_instance_id("instance-id=../etc\n"), None);
++        assert_eq!(parse_instance_id("instance-id=a/b\n"), None);
++        assert_eq!(parse_instance_id("instance-id=a b\n"), None);
++        assert_eq!(parse_instance_id("instance-id=..\n"), None);
++        assert_eq!(parse_instance_id("instance-id=\n"), None);
++        assert_eq!(parse_instance_id("app=ai.storyteller.gridcraft\n"), None);
++    }
++
++    #[test]
++    fn key_file_per_instance() {
++        let dir = Path::new("/settings/gridcraft");
++        assert_eq!(key_path_for(dir, Some("1234"), 7979), dir.join("control-key.1234"));
++        assert_eq!(key_path_for(dir, None, 7979), dir.join("control-key.local-7979"));
++        assert_eq!(key_path_for(dir, None, 7980), dir.join("control-key.local-7980"));
++        if instance_id().is_none() {
++            assert_eq!(key_path(dir, 7979), dir.join("control-key.local-7979"));
++        }
++    }
++
++    #[test]
++    fn settings_dir_is_the_apps_folder() {
++        if let Some(d) = settings_dir() {
++            let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
++            assert!(name == "gridcraft" || name == "GridCraft", "{}", d.display());
++        }
++    }
++}
+diff --git a/crates/mcp/Cargo.toml b/crates/mcp/Cargo.toml
+index d634166..8359a83 100644
+--- a/crates/mcp/Cargo.toml
++++ b/crates/mcp/Cargo.toml
+@@ -10,5 +10,7 @@ workspace = true
+ 
+ [dependencies]
+ gridcraft-engine = { workspace = true }
++# Where the app writes its control key.
++gridcraft-control-key = { workspace = true }
+ serde_json = { workspace = true }
+ log = { workspace = true }
+diff --git a/crates/mcp/src/backend.rs b/crates/mcp/src/backend.rs
+index adc866d..fe0af3b 100644
+--- a/crates/mcp/src/backend.rs
++++ b/crates/mcp/src/backend.rs
+@@ -1,7 +1,8 @@
+ //! Where MCP tool calls end up: a control-channel method call.
+ 
+ use std::io::{BufRead, BufReader, Write};
+-use std::net::{TcpStream, ToSocketAddrs};
++use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
++use std::path::Path;
+ use std::time::Duration;
+ 
+ use serde_json::{Value, json};
+@@ -22,18 +23,78 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
+ /// Longest reply line accepted from the app (guards against a runaway peer).
+ const MAX_REPLY: u64 = 256 * 1024 * 1024;
+ 
++/// Looks up the control key for an address (`HOST:PORT`).
++pub(crate) type KeyFinder = Box<dyn Fn(&str) -> Result<String, String> + Send>;
++
+ /// A running GridCraft app, reached through its loopback control port.
+ pub struct Remote {
+     addr: String,
+     conn: Option<(BufReader<TcpStream>, TcpStream)>,
+     next_id: u64,
++    /// The connection leads to a loopback address: requests carry the control key.
++    send_key: bool,
++    /// The control key, looked up once per connection (the app picks a new one at every start).
++    key: Option<String>,
++    find_key: KeyFinder,
++}
++
++/// The control key: `env` (`GRIDCRAFT_CONTROL_KEY`) when set, else the app's key file for
++/// `port` in `settings`. The error says where it looked.
++fn lookup_key(env: Option<String>, settings: Option<&Path>, port: Option<u16>) -> Result<String, String> {
++    if let Some(k) = env.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
++        return Ok(k);
++    }
++    let (Some(settings), Some(port)) = (settings, port) else {
++        return Err("no control key: set GRIDCRAFT_CONTROL_KEY (no settings folder or port to find the key file)".to_string());
++    };
++    let path = gridcraft_control_key::key_path(settings, port);
++    match std::fs::read_to_string(&path).map(|k| k.trim().to_string()) {
++        Ok(k) if !k.is_empty() => Ok(k),
++        _ => Err(format!("no control key: set GRIDCRAFT_CONTROL_KEY, or start the app with --control {port} (it writes {})", path.display())),
++    }
++}
++
++/// The key for the app at `addr`, from the environment or the app's key file.
++fn find_key(addr: &str) -> Result<String, String> {
++    let port = addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok());
++    lookup_key(std::env::var("GRIDCRAFT_CONTROL_KEY").ok(), gridcraft_control_key::settings_dir().as_deref(), port)
++}
++
++/// Whether `addr` (`HOST:PORT`, as given to `--connect`) names a loopback address: 127.0.0.0/8,
++/// ::1 or `localhost`. Other host names are not resolved: they never count.
++fn is_loopback_addr(addr: &str) -> bool {
++    let loopback = |ip: IpAddr| ip.to_canonical().is_loopback();
++    if let Ok(sa) = addr.parse::<SocketAddr>() {
++        return loopback(sa.ip());
++    }
++    if let Ok(ip) = addr.parse::<IpAddr>() {
++        return loopback(ip);
++    }
++    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
++    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
++    host.parse::<IpAddr>().map_or_else(|_| host.eq_ignore_ascii_case("localhost"), loopback)
++}
++
++/// The key goes only to a loopback `--connect` address, and only when the connection really
++/// leads to one (`peer`, so a `localhost` that resolves elsewhere gets no key either).
++fn may_send_key(addr: &str, peer: Option<SocketAddr>) -> bool {
++    is_loopback_addr(addr) && peer.is_some_and(|p| p.ip().to_canonical().is_loopback())
+ }
+ 
+ impl Remote {
+-    /// Connect to `addr` (`127.0.0.1:7979`), failing fast when nothing is listening.
++    /// Connect to `addr` (`127.0.0.1:7979`), failing fast when nothing is listening. Requests
++    /// carry the app's control key (`GRIDCRAFT_CONTROL_KEY`, else the app's key file) when the
++    /// address is a loopback one.
+     pub fn connect(addr: &str) -> std::io::Result<Self> {
+-        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1 };
++        Self::connect_with(addr, Box::new(find_key))
++    }
++
++    pub(crate) fn connect_with(addr: &str, find_key: KeyFinder) -> std::io::Result<Self> {
++        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1, send_key: false, key: None, find_key };
+         r.reconnect()?;
++        if let Some(w) = r.key_warning() {
++            log::warn!("{w}");
++        }
+         Ok(r)
+     }
+ 
+@@ -41,8 +102,19 @@ impl Remote {
+         &self.addr
+     }
+ 
++    /// Why requests go without the control key (the address is not loopback), if they do.
++    pub fn key_warning(&self) -> Option<String> {
++        (!self.send_key).then(|| {
++            format!(
++                "{} is not a loopback address, so the control key is not sent (it only goes to 127.0.0.0/8, ::1 and localhost) and the app refuses requests; reach the app through 127.0.0.1, for example with an SSH tunnel",
++                self.addr
++            )
++        })
++    }
++
+     fn reconnect(&mut self) -> std::io::Result<()> {
+         self.conn = None;
++        self.key = None;
+         let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, format!("cannot resolve {}", self.addr));
+         for sa in self.addr.to_socket_addrs()? {
+             match TcpStream::connect_timeout(&sa, Duration::from_secs(2)) {
+@@ -50,6 +122,7 @@ impl Remote {
+                     s.set_nodelay(true).ok();
+                     s.set_read_timeout(Some(IO_TIMEOUT)).ok();
+                     s.set_write_timeout(Some(IO_TIMEOUT)).ok();
++                    self.send_key = may_send_key(&self.addr, s.peer_addr().ok());
+                     let read = s.try_clone()?;
+                     self.conn = Some((BufReader::new(read), s));
+                     return Ok(());
+@@ -60,10 +133,22 @@ impl Remote {
+         Err(last)
+     }
+ 
+-    fn roundtrip(&mut self, line: &str) -> std::io::Result<String> {
+-        if self.conn.is_none() {
+-            self.reconnect()?;
++    /// The request line; it carries the key when this connection may (looked up once per
++    /// connection).
++    fn request_line(&mut self, id: u64, method: &str, params: &Value) -> Result<String, String> {
++        let mut req = json!({"id": id, "method": method, "params": params});
++        if self.send_key {
++            let key = match &self.key {
++                Some(k) => k.clone(),
++                None => (self.find_key)(&self.addr)?,
++            };
++            req["key"] = json!(key);
++            self.key = Some(key);
+         }
++        Ok(req.to_string())
++    }
++
++    fn roundtrip(&mut self, line: &str) -> std::io::Result<String> {
+         let Some((reader, writer)) = self.conn.as_mut() else {
+             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected"));
+         };
+@@ -77,27 +162,61 @@ impl Remote {
+         }
+         Ok(reply)
+     }
++
++    /// One request and its reply, with one retry on a new connection (the app may have
++    /// restarted; a new connection also reads the key again).
++    fn exchange(&mut self, id: u64, method: &str, params: &Value) -> Result<Value, String> {
++        let unreachable = |addr: &str, e: std::io::Error| format!("GridCraft app at {addr} is not reachable: {e}");
++        let mut first = true;
++        let reply = loop {
++            let tried = if self.conn.is_some() { Ok(()) } else { self.reconnect() };
++            let result = match tried {
++                Ok(()) => {
++                    let line = self.request_line(id, method, params)?;
++                    self.roundtrip(&line)
++                }
++                Err(e) => Err(e),
++            };
++            match result {
++                Ok(r) => break r,
++                Err(e) => {
++                    self.conn = None;
++                    if !first {
++                        return Err(unreachable(&self.addr, e));
++                    }
++                    first = false;
++                }
++            }
++        };
++        serde_json::from_str(reply.trim()).map_err(|e| format!("bad reply from app: {e}"))
++    }
+ }
+ 
+ impl Backend for Remote {
+     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+         let id = self.next_id;
+         self.next_id = self.next_id.wrapping_add(1);
+-        let line = json!({"id": id, "method": method, "params": params}).to_string();
+-        // One retry with a fresh connection (the app may have restarted).
+-        let reply = match self.roundtrip(&line) {
+-            Ok(r) => r,
+-            Err(_) => {
+-                self.conn = None;
+-                self.roundtrip(&line).map_err(|e| {
+-                    self.conn = None;
+-                    format!("GridCraft app at {} is not reachable: {e}", self.addr)
+-                })?
+-            }
+-        };
+-        let v: Value = serde_json::from_str(reply.trim()).map_err(|e| format!("bad reply from app: {e}"))?;
++        let unauthorized = |v: &Value| v.get("error").and_then(Value::as_str) == Some("unauthorized");
++        let mut v = self.exchange(id, method, &params)?;
++        if unauthorized(&v) && self.send_key {
++            // A stale key (the app restarted on this port): the app closed the connection; a new
++            // one reads the key again. Once.
++            self.conn = None;
++            v = self.exchange(id, method, &params)?;
++        }
+         if v.get("ok").and_then(Value::as_bool) == Some(true) {
+             Ok(v.get("result").cloned().unwrap_or(Value::Null))
++        } else if unauthorized(&v) {
++            self.conn = None;
++            Err(self.key_warning().map_or_else(
++                || {
++                    format!(
++                        "unauthorized: the GridCraft app at {} refused the control key (from GRIDCRAFT_CONTROL_KEY or the app's key file)",
++                        self.addr
++                    )
++                },
++                |w| format!("unauthorized: {w}"),
++            ))
+         } else {
+             Err(v.get("error").and_then(Value::as_str).unwrap_or("unknown error").to_string())
+         }
+@@ -111,3 +230,165 @@ impl Backend for Remote {
+         format!("connected to the GridCraft app at {}", self.addr)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
++    use super::*;
++    use std::net::{SocketAddr, TcpListener};
++    use std::sync::Arc;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::sync::mpsc::{Receiver, channel};
++
++    #[test]
++    fn key_from_env_then_key_file() {
++        let dir = std::env::temp_dir().join(format!("gridcraft-mcp-key-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = gridcraft_control_key::key_path(&dir, 7979);
++        // Neither: the error names the variable and the file it looked for.
++        let e = lookup_key(None, Some(&dir), Some(7979)).unwrap_err();
++        assert!(e.contains("GRIDCRAFT_CONTROL_KEY") && e.contains(&path.display().to_string()), "{e}");
++        // The key file, trimmed; an empty variable does not count.
++        std::fs::write(&path, "  file-key\n").unwrap();
++        assert_eq!(lookup_key(None, Some(&dir), Some(7979)).unwrap(), "file-key");
++        assert_eq!(lookup_key(Some(" ".into()), Some(&dir), Some(7979)).unwrap(), "file-key");
++        // The variable wins.
++        assert_eq!(lookup_key(Some(" env-key ".into()), Some(&dir), Some(7979)).unwrap(), "env-key");
++        assert_eq!(lookup_key(Some("env-key".into()), None, None).unwrap(), "env-key");
++        // Read again every time: the app writes a new key at every start.
++        std::fs::write(&path, "new-key").unwrap();
++        assert_eq!(lookup_key(None, Some(&dir), Some(7979)).unwrap(), "new-key");
++        // Another port, another file.
++        assert!(lookup_key(None, Some(&dir), Some(7980)).is_err());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn key_only_for_loopback_addresses() {
++        let peer = |s: &str| s.parse::<SocketAddr>().ok();
++        for (addr, at) in [
++            ("127.0.0.1:7979", "127.0.0.1:7979"),
++            ("127.0.0.2:7979", "127.0.0.2:7979"),
++            ("[::1]:7979", "[::1]:7979"),
++            ("[::ffff:127.0.0.1]:7979", "[::ffff:127.0.0.1]:7979"),
++            ("localhost:7979", "127.0.0.1:7979"),
++            ("localhost:7979", "[::1]:7979"),
++            ("LocalHost:7979", "127.0.0.1:7979"),
++        ] {
++            assert!(may_send_key(addr, peer(at)), "{addr} at {at}");
++        }
++        for (addr, at) in [
++            ("192.0.2.20:7979", "192.0.2.20:7979"),
++            ("10.0.0.7:7979", "10.0.0.7:7979"),
++            ("[fe80::1]:7979", "[fe80::1]:7979"),
++            ("0.0.0.0:7979", "127.0.0.1:7979"),
++            // Host names other than localhost: even when they lead to this machine.
++            ("workstation:7979", "127.0.1.1:7979"),
++            ("example.org:7979", "93.184.215.14:7979"),
++            ("localhost.example.org:7979", "127.0.0.1:7979"),
++            // `localhost` that does not lead to a loopback address.
++            ("localhost:7979", "192.0.2.20:7979"),
++        ] {
++            assert!(!may_send_key(addr, peer(at)), "{addr} at {at}");
++        }
++        // No peer address: no key.
++        assert!(!may_send_key("127.0.0.1:7979", None));
++    }
++
++    /// A stand-in for the app on 127.0.0.1: every request line goes to the returned channel and
++    /// gets `answer(request)`: a reply and whether to close the connection after it, or `None`
++    /// to close it without a reply (the app quit).
++    fn fake_app(answer: impl Fn(&Value) -> Option<(Value, bool)> + Send + Sync + 'static) -> (u16, Receiver<Value>) {
++        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let (tx, rx) = channel();
++        let answer = Arc::new(answer);
++        std::thread::spawn(move || {
++            for stream in listener.incoming().flatten() {
++                let (tx, answer) = (tx.clone(), answer.clone());
++                std::thread::spawn(move || {
++                    let mut out = stream.try_clone().unwrap();
++                    for line in BufReader::new(stream).lines() {
++                        let Ok(req) = serde_json::from_str::<Value>(&line.unwrap_or_default()) else { return };
++                        let _ = tx.send(req.clone());
++                        let Some((mut reply, close)) = answer(&req) else { return };
++                        reply["id"] = req["id"].clone();
++                        if writeln!(out, "{reply}").is_err() || close {
++                            return;
++                        }
++                    }
++                });
++            }
++        });
++        (port, rx)
++    }
++
++    fn fixed_key(key: &'static str) -> KeyFinder {
++        Box::new(move |_| Ok(key.to_string()))
++    }
++
++    const WAIT: Duration = Duration::from_secs(5);
++
++    #[test]
++    fn sends_the_key_to_loopback() {
++        let (port, seen) = fake_app(|_| Some((json!({"ok": true, "result": 7}), false)));
++        for host in ["127.0.0.1", "localhost"] {
++            let mut r = Remote::connect_with(&format!("{host}:{port}"), fixed_key("k1")).unwrap();
++            assert!(r.key_warning().is_none(), "{host}");
++            assert_eq!(r.call("document.inspect", json!({})).unwrap(), json!(7));
++            assert_eq!(seen.recv_timeout(WAIT).unwrap()["key"], "k1", "{host}");
++        }
++    }
++
++    #[test]
++    fn reads_the_key_again_on_a_new_connection() {
++        // The app restarted with a new key: the old key is refused (and the connection closed).
++        let (port, seen) = fake_app(|req| {
++            Some(if req["key"] == "new" { (json!({"ok": true, "result": 1}), false) } else { (json!({"ok": false, "error": "unauthorized"}), true) })
++        });
++        let reads = Arc::new(AtomicUsize::new(0));
++        let n = reads.clone();
++        let finder: KeyFinder = Box::new(move |_| Ok(if n.fetch_add(1, Ordering::SeqCst) == 0 { "old" } else { "new" }.to_string()));
++        let mut r = Remote::connect_with(&format!("127.0.0.1:{port}"), finder).unwrap();
++        assert_eq!(r.call("document.inspect", json!({})).unwrap(), json!(1));
++        assert_eq!(seen.recv_timeout(WAIT).unwrap()["key"], "old");
++        assert_eq!(seen.recv_timeout(WAIT).unwrap()["key"], "new");
++        assert_eq!(reads.load(Ordering::SeqCst), 2);
++        // The new key is kept for the next requests on the same connection.
++        assert_eq!(r.call("document.inspect", json!({})).unwrap(), json!(1));
++        assert_eq!(reads.load(Ordering::SeqCst), 2);
++
++        // The app quits mid-session (connection closed): the retry reads the key again.
++        let (port, seen) = fake_app(|req| if req["id"] == 2 { None } else { Some((json!({"ok": true, "result": 1}), false)) });
++        let reads = Arc::new(AtomicUsize::new(0));
++        let n = reads.clone();
++        let finder: KeyFinder = Box::new(move |_| Ok(format!("key-{}", n.fetch_add(1, Ordering::SeqCst))));
++        let mut r = Remote::connect_with(&format!("127.0.0.1:{port}"), finder).unwrap();
++        r.call("document.inspect", json!({})).unwrap();
++        r.call("document.inspect", json!({})).unwrap_err();
++        let keys: Vec<Value> = seen.try_iter().map(|v| v["key"].clone()).collect();
++        assert_eq!(keys.first(), Some(&json!("key-0")), "{keys:?}");
++        assert_eq!(keys.last(), Some(&json!("key-1")), "{keys:?}");
++    }
++
++    #[test]
++    fn no_key_for_other_hosts_and_a_clear_error() {
++        // There is no LAN address to test with here: same stand-in, with the decision a LAN
++        // address gets.
++        let (port, seen) = fake_app(|req| {
++            Some(if req.get("key").is_some() {
++                (json!({"ok": true, "result": 1}), false)
++            } else {
++                (json!({"ok": false, "error": "unauthorized"}), true)
++            })
++        });
++        let finder: KeyFinder = Box::new(|_| Err("the key must not be read for another host".to_string()));
++        let mut r = Remote::connect_with(&format!("127.0.0.1:{port}"), finder).unwrap();
++        r.send_key = false;
++        assert!(r.key_warning().is_some_and(|w| w.contains("not a loopback address")));
++        let e = r.call("document.inspect", json!({})).unwrap_err();
++        assert!(e.contains("not a loopback address") && e.contains("not sent"), "{e}");
++        assert!(seen.recv_timeout(WAIT).unwrap().get("key").is_none());
++    }
++}
+diff --git a/crates/mcp/src/tests.rs b/crates/mcp/src/tests.rs
+index de6bbc6..72d8467 100644
+--- a/crates/mcp/src/tests.rs
++++ b/crates/mcp/src/tests.rs
+@@ -385,7 +385,8 @@ fn remote_backend_over_tcp() {
+     });
+     let addr = control_addr(&port.to_string());
+     assert_eq!(addr, format!("127.0.0.1:{port}"));
+-    let mut s = Server::new(Box::new(Remote::connect(&addr).unwrap()));
++    // The fake app takes any key (the real one checks it: `apps/gridcraft/src/control_server.rs`).
++    let mut s = Server::new(Box::new(Remote::connect_with(&addr, Box::new(|_| Ok("key".into()))).unwrap()));
+     assert_eq!(ok(&mut s, "evaluate_formula", json!({"formula": "=1+1"}))["result"], json!(2.0));
+     // Second call reconnects transparently.
+     ok(&mut s, "set_cell", json!({"cell": "A1", "input": "7"}));
+diff --git a/docs/control-protocol.md b/docs/control-protocol.md
+index 7cc6ec2..b68740c 100644
+--- a/docs/control-protocol.md
++++ b/docs/control-protocol.md
+@@ -6,14 +6,50 @@ Start the desktop app with a control port:
+ gridcraft --control 7979            # or GRIDCRAFT_CONTROL_PORT=7979
+ ```
+ 
+-Then send newline-delimited JSON to `127.0.0.1:7979`. Every request line gets one reply line:
++Then send newline-delimited JSON to `127.0.0.1:7979`, with the window's key (see [Keys](#keys)).
++Every request line gets one reply line:
+ 
+ ```json
+-{"id": 1, "method": "engine.execute", "params": {"command": "cell.set", "params": {"cell": "B2", "input": "=SUM(A1:A9)"}}}
++{"id": 1, "key": "…", "method": "engine.execute", "params": {"command": "cell.set", "params": {"cell": "B2", "input": "=SUM(A1:A9)"}}}
+ {"id": 1, "ok": true, "result": {"cell": "B2", "value": "45"}}
+ ```
+ 
+-Errors come back as `{"id": …, "ok": false, "error": "…"}`.
++Errors come back as `{"id": …, "ok": false, "error": "…"}`. A line that isn't valid JSON gets one
++error reply, then the app closes the connection (so an HTTP request sent to the port can't run a
++command); reconnect to continue.
++
++## Keys
++
++Any local program (and possibly a web page) can reach a loopback port, so every request needs the
++window's key. Once the port is bound, the app writes a random key (256 bits, as hex) to
++`<settings>/control-key.<instance>` and removes the file when the window closes; a new start
++writes a new key. `<settings>` is the folder that holds the preferences: on Linux
++`$XDG_CONFIG_HOME/gridcraft` (by default `~/.config/gridcraft`), on macOS
++`~/Library/Application Support/GridCraft`, on Windows `%APPDATA%\GridCraft`. `<instance>` is the
++Flatpak instance id inside Flatpak, and `local-<port>` otherwise. On Unix the file has mode 0600.
++
++```sh
++cat ~/.config/gridcraft/control-key.local-7979   # Linux, outside Flatpak, port 7979
++```
++
++- Send the key as top-level `"key"` with every request, or once per connection with
++  `{"method": "auth", "key": "…"}` (reply `{"ok": true, "result": {}}`); later requests on that
++  connection may leave `key` out. Only `auth` reads `params.key`; for other methods `params.key`
++  is an ordinary parameter (`ui.key {"key": "Enter"}` presses Enter).
++- The key is checked on every request. A missing or wrong key gets
++  `{"ok": false, "error": "unauthorized"}`, and the app closes the connection.
++- A line over 64 MiB gets `{"ok": false, "error": "line too long"}`, and the app closes the
++  connection.
++- A connection that sends no authorised request within 30 s of being accepted is closed. That is
++  one limit: blank lines and bad JSON do not extend it. After an authorised request the
++  connection may stay idle.
++
++`gridcraft-cli mcp --connect` and `gridcraft-cli send` take the key from `GRIDCRAFT_CONTROL_KEY`,
++or else from the key file for the port they connect to, and read it again on every new connection
++(the app may have restarted). They send the key only to loopback addresses (`127.0.0.0/8`, `::1`,
++`localhost`). For any other host they send no key, say so, and the app refuses the requests: to
++drive an app on another machine, forward its port to `127.0.0.1` (for example
++`ssh -L 7979:127.0.0.1:7979 host`) and set `GRIDCRAFT_CONTROL_KEY` to that app's key.
+ 
+ ## Methods
+ 
+diff --git a/docs/mcp.md b/docs/mcp.md
+index 3e6e7bc..8af464e 100644
+--- a/docs/mcp.md
++++ b/docs/mcp.md
+@@ -11,6 +11,10 @@ Two backends:
+ | Headless (default) | `gridcraft-cli mcp [--in book.xlsx \| --sample budget]` | An in-process engine session — no window. |
+ | Remote | `gridcraft-cli mcp --connect 7979` | A running app started with `gridcraft --control 7979` (TCP JSON lines on `127.0.0.1`). |
+ 
++With `--connect`, the bridge sends the app's control key, which it reads from
++`GRIDCRAFT_CONTROL_KEY` or from the key file the app writes at start. It sends the key only to
++loopback addresses; see [Keys](control-protocol.md#keys).
++
+ ## Claude Code
+ 
+ ```sh
+diff --git a/xtask/src/layers.rs b/xtask/src/layers.rs
+index 0d19907..880e81c 100644
+--- a/xtask/src/layers.rs
++++ b/xtask/src/layers.rs
+@@ -29,6 +29,7 @@ pub const TABLE: &[(&str, Class)] = &[
+     ("core", Class::Layer(0)),
+     ("numfmt", Class::Layer(0)),
+     ("pdf", Class::Layer(0)),
++    ("control-key", Class::Layer(0)),
+     ("formula", Class::Layer(1)),
+     ("functions", Class::Layer(1)),
+     ("model", Class::Layer(2)),
+-- 
+2.52.0.windows.1
+

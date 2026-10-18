@@ -1,0 +1,291 @@
+From c0a194f815cd75989ea2c1fb97494c7c0bfc824f Mon Sep 17 00:00:00 2001
+From: Lovelace's Square <noreply@lovelacesquare.org>
+Date: Sun, 18 Oct 2026 10:21:29 +0200
+Subject: [PATCH 3/4] Let assistants connect: a setting that opens every
+ window's control channel
+
+A window opened from the file manager has no control port, so an
+assistant the user works with (an MCP client, say) cannot join the deck
+the user is editing. Preferences gets an Assistants section with "Let
+assistants connect to this window", off by default. When on, a window
+started without --control opens its control channel as `--control auto`
+does (a free port, the key file named after it); the key is still
+required on every request. As in WordCraft.
+
+- ui-egui: UiState::allow_assistants (allowAssistants in ui.json), the
+  `app.allowAssistants {on?}` UI command (no value toggles, like the
+  other switches) and the `allowAssistants` key of ui.set, and the
+  checkbox with a short note in Preferences (not on the web, which has
+  no control channel).
+- deckcraft: the setting picks `auto` at start-up when no port was
+  given; changed while running, it is saved at once (so windows opened
+  next follow it) and turning it on opens this window's channel. Turning
+  it off leaves an open channel until the window closes.
+- docs: control-protocol.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Esdp3ZTPsHBV41yHxMJHnJ
+---
+ apps/deckcraft/src/main.rs    | 45 +++++++++++++++++++++------
+ crates/ui-egui/src/control.rs |  6 +++-
+ crates/ui-egui/src/dialogs.rs | 15 +++++++++
+ crates/ui-egui/src/lib.rs     | 58 +++++++++++++++++++++++++++++++++++
+ docs/control-protocol.md      |  7 ++++-
+ 5 files changed, 120 insertions(+), 11 deletions(-)
+
+diff --git a/apps/deckcraft/src/main.rs b/apps/deckcraft/src/main.rs
+index 7753bcb..a1ab548 100644
+--- a/apps/deckcraft/src/main.rs
++++ b/apps/deckcraft/src/main.rs
+@@ -23,12 +23,29 @@ mod logging;
+ use deckcraft_engine::Session;
+ use deckcraft_ui_egui::{Services, SlideApp};
+ 
+-/// The app and the control server's key file (removed on exit).
+-struct App(SlideApp, Option<control_server::KeyFile>);
++/// The app, the control server's key file (removed on exit) and the control channel's state.
++struct App(SlideApp, Option<control_server::KeyFile>, Control);
++
++/// Whether the window's control channel is open, and Preferences › Assistants › Let assistants
++/// connect as of the last frame.
++struct Control {
++    open: bool,
++    allow_assistants: bool,
++}
+ 
+ impl eframe::App for App {
+     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+         self.0.logic(ctx);
++        // Let assistants connect, changed in Preferences or by `app.allowAssistants`: saved at
++        // once, so windows opened from now on follow it, and turned on, it opens this window's
++        // control channel on a free port. Turned off, an open channel stays until the window closes.
++        if self.0.ui.allow_assistants != self.2.allow_assistants {
++            self.2.allow_assistants = self.0.ui.allow_assistants;
++            save_prefs(&self.0);
++            if self.2.allow_assistants && !self.2.open {
++                self.2.open = open_control(&mut self.0, control_server::AUTO, ctx, &mut self.1);
++            }
++        }
+     }
+     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+         self.0.raw_input_hook(raw);
+@@ -50,6 +67,15 @@ fn config_dir() -> Option<std::path::PathBuf> {
+     deckcraft_control_key::settings_dir()
+ }
+ 
++/// Start the control server on `port` ([`control_server::AUTO`]: a free one) and hand its
++/// requests to the app; its key file goes in `key_file`. Whether it started.
++fn open_control(app: &mut SlideApp, port: u16, ctx: &egui::Context, key_file: &mut Option<control_server::KeyFile>) -> bool {
++    let Some((rx, file)) = control_server::start(port, ctx.clone(), config_dir().as_deref()) else { return false };
++    app.control_rx = Some(rx);
++    *key_file = file;
++    true
++}
++
+ fn prefs_path() -> Option<std::path::PathBuf> {
+     config_dir().map(|b| b.join("ui.json"))
+ }
+@@ -208,12 +234,13 @@ fn main() -> eframe::Result {
+             }
+             app.integrated_titlebar = cfg!(target_os = "macos");
+             let mut key_file = None;
+-            if let Some(port) = control_port
+-                && let Some((rx, file)) = control_server::start(port, cc.egui_ctx.clone(), config_dir().as_deref())
+-            {
+-                app = app.with_control(rx);
+-                key_file = file;
+-            }
++            // With Let assistants connect on (Preferences › Assistants), a window started without a
++            // control port opens one anyway, on a free port: `--control auto`.
++            let port = control_port.or_else(|| app.ui.allow_assistants.then_some(control_server::AUTO));
++            let control = Control {
++                open: port.is_some_and(|port| open_control(&mut app, port, &cc.egui_ctx, &mut key_file)),
++                allow_assistants: app.ui.allow_assistants,
++            };
+             if sample && let Err(e) = deckcraft_engine::sample::open_sample(&mut app.session) {
+                 log::error!("sample: {e}");
+             }
+@@ -225,7 +252,7 @@ fn main() -> eframe::Result {
+             if show {
+                 app.start_show(0, false);
+             }
+-            Ok(Box::new(App(app, key_file)))
++            Ok(Box::new(App(app, key_file, control)))
+         }),
+     )
+ }
+diff --git a/crates/ui-egui/src/control.rs b/crates/ui-egui/src/control.rs
+index d344d91..bf15d82 100644
+--- a/crates/ui-egui/src/control.rs
++++ b/crates/ui-egui/src/control.rs
+@@ -9,7 +9,8 @@
+ //! - `ui.tool.select {tool, preset?}`
+ //! - `ui.click {x, y, button?, count?}` / `ui.move {x, y}` / `ui.drag {x, y, toX, toY, steps?}`: real egui pointer
+ //!   input in window points (reaches every widget)
+-//! - `ui.set {tab?, pane?, view?, zoom?, dark?, notes?, ribbonCollapsed?}`; `ui.dialog.close`
++//! - `ui.set {tab?, pane?, view?, zoom?, dark?, notes?, ribbonCollapsed?, allowAssistants?}`;
++//!   `ui.dialog.close`
+ //! - `ui.screenshot {path?}`: the whole window as PNG; `ui.render {slide?, scale?, path?}`: one slide (headless)
+ //! - `ui.resize {width, height}`, `ui.focus`
+ //! - `show.start {from?}`, `show.key {key}`, `show.end`
+@@ -243,6 +244,9 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) ->
+             if let Some(ft) = s("formatTab") {
+                 app.ui.format_tab = ft.to_string();
+             }
++            if let Some(on) = p.get("allowAssistants").and_then(Value::as_bool) {
++                let _ = app.run("app.allowAssistants", json!({"on": on}));
++            }
+             ok(serde_json::to_value(&app.ui).unwrap_or_default())
+         }
+         "ui.dialog.close" => {
+diff --git a/crates/ui-egui/src/dialogs.rs b/crates/ui-egui/src/dialogs.rs
+index d1934be..f33baa2 100644
+--- a/crates/ui-egui/src/dialogs.rs
++++ b/crates/ui-egui/src/dialogs.rs
+@@ -727,6 +727,21 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
+                 ui.label("Your name (comments):");
+                 ui.text_edit_singleline(&mut app.session.prefs.author);
+             });
++            // The web app has no control channel to open.
++            if !cfg!(target_arch = "wasm32") {
++                ui.label(egui::RichText::new("Assistants").font(theme::bold(13.0)));
++                let mut allow = app.ui.allow_assistants;
++                if ui.checkbox(&mut allow, "Let assistants connect to this window").changed() {
++                    let _ = app.run("app.allowAssistants", json!({"on": allow}));
++                }
++                ui.label(
++                    egui::RichText::new(
++                        "When on, DeckCraft windows accept AI assistants running on this computer (such as an MCP client), so they can read and edit the presentation with you. Takes effect in this window now and in windows opened later.",
++                    )
++                    .small()
++                    .weak(),
++                );
++            }
+             let (ok, _) = buttons(ui, "Done");
+             ok
+         }
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index ec97e6e..79a70aa 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -102,6 +102,11 @@ pub struct UiState {
+     /// Format Shape pane: tab (`fill`, `effects`, `size`, `picture`, `text`).
+     pub format_tab: String,
+     pub grayscale: bool,
++    /// Preferences › Assistants: let assistants connect. Desktop: a window started without
++    /// `--control` opens its control channel anyway, on a free port (`--control auto`), so a
++    /// local program that can read the window's key file (an MCP client, say) can edit the deck
++    /// alongside the user. Off by default.
++    pub allow_assistants: bool,
+ }
+ 
+ impl Default for UiState {
+@@ -127,6 +132,7 @@ impl Default for UiState {
+             ui_scale: 1.0,
+             format_tab: "fill".into(),
+             grayscale: false,
++            allow_assistants: false,
+         }
+     }
+ }
+@@ -169,6 +175,7 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
+     ("app.exportDialog", "Export…", None, "{}"),
+     ("app.dialog", "Open Dialog", None, "{id}"),
+     ("app.links", "Community Links", None, "{}"),
++    ("app.allowAssistants", "Let Assistants Connect", None, "{on?: bool}"),
+ ];
+ 
+ pub struct Perf {
+@@ -549,6 +556,12 @@ impl SlideApp {
+                 use deckcraft_engine::links::*;
+                 return Ok(json!({"discord": DISCORD, "website": WEBSITE, "apps": APPS, "appPage": APP_PAGE, "github": GITHUB}));
+             }
++            // Preferences › Assistants: the desktop app opens a window's control channel on a free
++            // port while this is on (`--control auto`).
++            "app.allowAssistants" => {
++                self.ui.allow_assistants = self.flag(p, self.ui.allow_assistants);
++                return Ok(json!({"allowAssistants": self.ui.allow_assistants}));
++            }
+             _ => return Err(format!("unknown UI command `{id}`")),
+         }
+         Ok(Value::Null)
+@@ -1136,6 +1149,51 @@ mod tests {
+ 
+     use super::*;
+ 
++    /// Preferences › Assistants: letting assistants connect is off at first, a UI command
++    /// (`{on}` sets it, no value toggles it) and a `ui.set` key, and is kept with the UI state.
++    #[test]
++    fn allow_assistants_is_a_ui_command_and_survives_a_restart() {
++        let mut a = SlideApp::new(Session::with_new(), Services::default());
++        assert!(!a.ui.allow_assistants, "off by default");
++        assert_eq!(a.run("app.allowAssistants", json!({"on": true})).unwrap(), json!({"allowAssistants": true}));
++        assert_eq!(a.run("app.allowAssistants", json!({"on": true})).unwrap(), json!({"allowAssistants": true}));
++        assert_eq!(a.run("app.allowAssistants", json!({})).unwrap(), json!({"allowAssistants": false}), "no value toggles");
++        let ctx = egui::Context::default();
++        let (req, _rx) = ControlRequest::new("ui.set", json!({"allowAssistants": true}));
++        let r = match control::handle(&mut a, &ctx, &req) {
++            control::Outcome::Done(r) => r,
++            control::Outcome::Screenshot { .. } => Value::Null,
++        };
++        assert_eq!(r["result"]["allowAssistants"], true);
++        let saved = serde_json::to_string(&a.ui).unwrap();
++        assert!(saved.contains(r#""allowAssistants":true"#), "{saved}");
++        let back: UiState = serde_json::from_str(&saved).unwrap();
++        assert!(back.allow_assistants);
++        let old: UiState = serde_json::from_str(r#"{"tab":"Insert"}"#).unwrap();
++        assert!(!old.allow_assistants && old.tab == "Insert", "settings from before the option leave it off");
++    }
++
++    /// Preferences › Assistants: the checkbox turns it on and off.
++    #[test]
++    fn preferences_checkbox_lets_assistants_connect() {
++        use egui_kittest::kittest::Queryable;
++        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
++            |ui, app: &mut SlideApp| {
++                app.logic(ui.ctx());
++                app.ui(ui);
++            },
++            SlideApp::new(Session::with_new(), Services::default()),
++        );
++        harness.state_mut().run("app.preferences", json!({})).unwrap();
++        harness.run_steps(2);
++        harness.get_by_label("Let assistants connect to this window").click();
++        harness.run_steps(2);
++        assert!(harness.state().ui.allow_assistants, "the checkbox turns it on");
++        harness.get_by_label("Let assistants connect to this window").click();
++        harness.run_steps(2);
++        assert!(!harness.state().ui.allow_assistants, "and off again");
++    }
++
+     fn title_text(app: &SlideApp) -> String {
+         let d = app.session.active().unwrap();
+         let sh = &d.doc.slides[0].shapes[0];
+diff --git a/docs/control-protocol.md b/docs/control-protocol.md
+index 67b6e2e..05eb4ee 100644
+--- a/docs/control-protocol.md
++++ b/docs/control-protocol.md
+@@ -25,6 +25,11 @@ writes a new key. `<settings>` is the folder that holds the preferences: on Linu
+ Flatpak instance id inside Flatpak, and `local-<port>` otherwise, with the port the window is
+ listening on (also with `auto`). On Unix the file has mode 0600.
+ 
++A window started without `--control` has no control channel, unless Preferences › Assistants ›
++Let assistants connect (`allowAssistants` in `ui.json`, off by default) is on: then it opens one as
++`--control auto` does. Turning it on also opens the current window's channel and saves the
++setting at once; turning it off leaves an open channel until the window closes.
++
+ ```sh
+ cat ~/.config/deckcraft/control-key.local-7979   # Linux, outside Flatpak, port 7979
+ ```
+@@ -63,7 +68,7 @@ Coordinates are slide points (1/72 inch; a 16:9 slide is 960 × 540) unless note
+ | `ui.key` / `ui.text` | `{key, shift?, alt?, cmd?}` / `{text}` | Keyboard input (also drives a running slide show) |
+ | `ui.ime` | `{preedit, active?: [start, end]}` / `{commit}` | An input method's composition through egui, as a real one arrives: shown in place on the slide or in a focused field; `{"preedit": ""}` cancels |
+ | `ui.move` / `ui.click` / `ui.drag` | screen points | Real egui pointer input — reaches every widget, menu and pane |
+-| `ui.set` | `{tab?, view?, pane?, notes?, zoom?, brightness?, ruler?, gridlines?, guides?, …}` | UI state (returns the full state) |
++| `ui.set` | `{tab?, view?, pane?, notes?, zoom?, brightness?, ruler?, gridlines?, guides?, allowAssistants?, …}` | UI state (returns the full state; `allowAssistants` is Preferences › Assistants › Let assistants connect, also the `app.allowAssistants {on?}` command) |
+ | `ui.dialog.open` / `ui.dialog.close` | `{id, fields?}` | Open or close a dialog by id; `fields` pre-fills its fields (About: `{"tab": "contributors"}` or `"models"`) |
+ | `ui.screenshot` | `{path?}` | PNG of the whole window (base64 when no path) |
+ | `ui.render` | `{path?, slide?, scale?}` | Render a slide headlessly |
+-- 
+2.52.0.windows.1
+

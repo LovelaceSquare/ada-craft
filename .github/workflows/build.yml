@@ -1,0 +1,110 @@
+# Builds the patched apps for Windows from the pinned upstream commit
+# (upstream.json) plus this repo's patches. No secrets and no signing here:
+# the zip, its SHA-256 and a build-provenance attestation are uploaded as an
+# artifact; the owner signs and publishes on their own computer
+# (outside GitHub), where the update key lives.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "wordcraft, gridcraft, deckcraft or all"
+        required: true
+        default: all
+  push:
+    branches: [main]
+    paths: ["*/patches/**", "upstream.json", ".github/workflows/build.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.pick.outputs.apps }}
+    steps:
+      - id: pick
+        shell: bash
+        env:
+          APP: ${{ github.event.inputs.app || 'all' }}
+        run: |
+          case "$APP" in
+            all) echo 'apps=["wordcraft","gridcraft","deckcraft"]' >> "$GITHUB_OUTPUT" ;;
+            wordcraft|gridcraft|deckcraft) echo "apps=[\"$APP\"]" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unknown app: $APP" >&2; exit 1 ;;
+          esac
+
+  build:
+    needs: matrix
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.matrix.outputs.apps) }}
+    env:
+      APP: ${{ matrix.app }}
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upstream at the pinned commit, with the patches applied
+        shell: pwsh
+        run: |
+          $u = (Get-Content upstream.json -Raw | ConvertFrom-Json).$env:APP
+          git clone --filter=blob:none $u.repo up
+          git -C up checkout --detach $u.commit
+          $tagged = git -C up rev-parse "$($u.tag)^{commit}"
+          if ($tagged -ne $u.commit) { throw "$($u.tag) is $tagged upstream, not the pinned $($u.commit)" }
+          git -C up -c user.name=ada-craft -c user.email=noreply@lovelacesquare.org am --3way (Get-ChildItem "$env:APP/patches/*.patch" | Sort-Object Name).FullName
+          if ($LASTEXITCODE -ne 0) { throw "The patches no longer apply on $($u.tag)" }
+
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+
+      - name: Build
+        shell: pwsh
+        working-directory: up
+        run: |
+          $u = (Get-Content ../upstream.json -Raw | ConvertFrom-Json).$env:APP
+          $p = $u.packages | ForEach-Object { "-p", $_ }
+          cargo build --release --locked @p
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $u = (Get-Content upstream.json -Raw | ConvertFrom-Json).$env:APP
+          $name = "$env:APP-ada-$($u.tag.TrimStart('v'))-windows-x64"
+          $stage = "dist/$name"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          foreach ($pkg in $u.packages) { Copy-Item "up/target/release/$pkg.exe" $stage }
+          foreach ($f in "LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "ATTRIBUTION.md") { if (Test-Path "up/$f") { Copy-Item "up/$f" $stage } }
+          Copy-Item README.md "$stage/ADA-CRAFT-README.md"
+          @{ app = $env:APP; upstream = $u.repo; tag = $u.tag; commit = $u.commit; adaCraftCommit = "$env:GITHUB_SHA"; patches = @(Get-ChildItem "$env:APP/patches/*.patch" | Sort-Object Name | ForEach-Object Name) } | ConvertTo-Json | Set-Content "$stage/build-info.json" -Encoding utf8
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content "dist/$name.zip.sha256" -Encoding ascii
+          "ZIP=dist/$name.zip" >> $env:GITHUB_ENV
+          "NAME=$name" >> $env:GITHUB_ENV
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ZIP }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+          if-no-files-found: error

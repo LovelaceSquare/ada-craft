@@ -1,0 +1,348 @@
+From f287ede50a944dbf323798ec739ae1e41361efe0 Mon Sep 17 00:00:00 2001
+From: Lovelace's Square <noreply@lovelacesquare.org>
+Date: Sun, 18 Oct 2026 10:22:15 +0200
+Subject: [PATCH 4/4] Status bar says "Assistant connected" while a control
+ connection is authorised
+
+With assistants allowed to join any window, the user should always see
+when one has. The control server now counts the connections that have
+sent an authorised request and are still open; while there are any, the
+status bar shows "Assistant connected" in the accent colour, with a
+tooltip saying what it means. As in WordCraft.
+
+- deckcraft: control_server::start takes the counter; a connection is
+  counted from its first authorised request until it closes, and the
+  window repaints on each change. Refused connections never count.
+- ui-egui: SlideApp::control_clients and assistant_connected(), the
+  status bar item, and `controlClients` in ui.inspect.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Esdp3ZTPsHBV41yHxMJHnJ
+---
+ apps/deckcraft/src/control_server.rs | 94 +++++++++++++++++++++++-----
+ apps/deckcraft/src/main.rs           |  2 +-
+ crates/ui-egui/src/control.rs        |  3 +
+ crates/ui-egui/src/lib.rs            | 35 +++++++++++
+ crates/ui-egui/src/status.rs         | 12 +++-
+ 5 files changed, 127 insertions(+), 19 deletions(-)
+
+diff --git a/apps/deckcraft/src/control_server.rs b/apps/deckcraft/src/control_server.rs
+index 0628adc..df3c798 100644
+--- a/apps/deckcraft/src/control_server.rs
++++ b/apps/deckcraft/src/control_server.rs
+@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Read, Write};
+ use std::net::{TcpListener, TcpStream};
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::mpsc::{Receiver, Sender, channel};
+ use std::time::{Duration, Instant};
+ 
+@@ -49,10 +50,16 @@ pub fn parse_port(s: &str) -> Option<u16> {
+ }
+ 
+ /// Bind `127.0.0.1:port` ([`AUTO`]: a free port), write the key file for the port bound into
+-/// `settings` and serve. `None` when the port cannot be bound or there is no random key (the
+-/// control channel is off); the key file is `None` when it could not be written (requests are
+-/// then refused).
+-pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>) -> Option<(Receiver<ControlRequest>, Option<KeyFile>)> {
++/// `settings` and serve. `clients` counts the connections that have sent an authorised request
++/// and are still open (the status bar shows them). `None` when the port cannot be bound or there
++/// is no random key (the control channel is off); the key file is `None` when it could not be
++/// written (requests are then refused).
++pub fn start(
++    port: u16,
++    ctx: egui::Context,
++    settings: Option<&Path>,
++    clients: Arc<AtomicUsize>,
++) -> Option<(Receiver<ControlRequest>, Option<KeyFile>)> {
+     let listener = match TcpListener::bind(("127.0.0.1", port)) {
+         Ok(l) => l,
+         Err(e) => {
+@@ -95,7 +102,7 @@ pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>) -> Option<(
+         Some(f) => log::info!("control server listening on 127.0.0.1:{port}, key in {}", f.path().display()),
+         None => log::info!("control server listening on 127.0.0.1:{port}"),
+     }
+-    Some((serve_on(listener, ctx, key, FIRST_REQUEST), key_file))
++    Some((serve_on(listener, ctx, key, FIRST_REQUEST, clients), key_file))
+ }
+ 
+ /// A new key: 32 random bytes from the operating system, as hex.
+@@ -127,18 +134,37 @@ fn keys_match(given: &str, key: &str) -> bool {
+     !b.is_empty() && a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+ }
+ 
+-fn serve_on(listener: TcpListener, ctx: egui::Context, key: String, first: Duration) -> Receiver<ControlRequest> {
++fn serve_on(listener: TcpListener, ctx: egui::Context, key: String, first: Duration, clients: Arc<AtomicUsize>) -> Receiver<ControlRequest> {
+     let (tx, rx) = channel::<ControlRequest>();
+     let key: Arc<str> = key.into();
+     std::thread::spawn(move || {
+         for stream in listener.incoming().flatten() {
+-            let (tx, ctx, key) = (tx.clone(), ctx.clone(), key.clone());
+-            std::thread::spawn(move || serve(stream, tx, ctx, &key, first));
++            let (tx, ctx, key, clients) = (tx.clone(), ctx.clone(), key.clone(), clients.clone());
++            std::thread::spawn(move || serve(stream, tx, ctx, &key, first, &clients));
+         }
+     });
+     rx
+ }
+ 
++/// An authorised connection, counted in the window's clients until it closes; the window
++/// repaints when the count changes (the status bar shows it).
++struct Connected(Arc<AtomicUsize>, egui::Context);
++
++impl Connected {
++    fn new(clients: &Arc<AtomicUsize>, ctx: &egui::Context) -> Self {
++        clients.fetch_add(1, Ordering::Relaxed);
++        ctx.request_repaint();
++        Self(clients.clone(), ctx.clone())
++    }
++}
++
++impl Drop for Connected {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::Relaxed);
++        self.1.request_repaint();
++    }
++}
++
+ /// The read side of a connection with an optional overall deadline: each read waits only for
+ /// the time left, so blank lines, bad JSON or a slow drip of bytes cannot extend it.
+ struct Timed {
+@@ -199,12 +225,13 @@ fn discard_rest_of_line(r: &mut BufReader<Timed>) {
+     }
+ }
+ 
+-fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key: &str, first: Duration) {
++fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key: &str, first: Duration, clients: &Arc<AtomicUsize>) {
+     let Ok(read) = stream.try_clone() else { return };
+     let mut out = stream;
+     // One overall deadline from accept to the first authorised request; after it, none.
+     let mut reader = BufReader::new(Timed { s: read, deadline: Some(Instant::now() + first) });
+-    let mut authorised = false;
++    // From the first authorised request on, the connection counts as a client until it closes.
++    let mut connected: Option<Connected> = None;
+     // The key an `auth` request gave this connection.
+     let mut conn_key: Option<String> = None;
+     while let Some(line) = read_line(&mut reader) {
+@@ -250,8 +277,8 @@ fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key:
+             let _ = reply(json!({"ok": false, "error": "unauthorized"}));
+             break;
+         }
+-        if !authorised {
+-            authorised = true;
++        if connected.is_none() {
++            connected = Some(Connected::new(clients, &ctx));
+             reader.get_mut().set_deadline(None);
+         }
+         if method == "auth" {
+@@ -284,7 +311,7 @@ mod tests {
+     fn boot_with(first: Duration) -> (u16, Receiver<ControlRequest>) {
+         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+         let port = listener.local_addr().unwrap().port();
+-        (port, serve_on(listener, egui::Context::default(), KEY.to_string(), first))
++        (port, serve_on(listener, egui::Context::default(), KEY.to_string(), first, Arc::default()))
+     }
+ 
+     fn boot() -> (u16, Receiver<ControlRequest>) {
+@@ -504,11 +531,11 @@ mod tests {
+         // The port is taken: no key file.
+         let taken = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+         let port = taken.local_addr().unwrap().port();
+-        assert!(start(port, egui::Context::default(), Some(&dir)).is_none());
++        assert!(start(port, egui::Context::default(), Some(&dir), Arc::default()).is_none());
+         assert!(!dir.exists() || std::fs::read_dir(&dir).unwrap().next().is_none(), "no key file after a failed bind");
+         drop(taken);
+         // Bound: the key file holds the key that opens the port.
+-        let (rx, key_file) = start(port, egui::Context::default(), Some(&dir)).unwrap();
++        let (rx, key_file) = start(port, egui::Context::default(), Some(&dir), Arc::default()).unwrap();
+         let key_file = key_file.unwrap();
+         assert_eq!(key_file.path(), deckcraft_control_key::key_path(&dir, port));
+         let key = std::fs::read_to_string(key_file.path()).unwrap();
+@@ -544,7 +571,7 @@ mod tests {
+     #[test]
+     fn auto_names_the_key_file_after_the_port_it_got() {
+         let dir = temp_dir("auto");
+-        let (rx, key_file) = start(AUTO, egui::Context::default(), Some(&dir)).unwrap();
++        let (rx, key_file) = start(AUTO, egui::Context::default(), Some(&dir), Arc::default()).unwrap();
+         let key_file = key_file.unwrap();
+         if deckcraft_control_key::instance_id().is_none() {
+             let name = key_file.path().file_name().unwrap().to_str().unwrap();
+@@ -558,7 +585,7 @@ mod tests {
+             assert_eq!(c.recv()["ok"], true);
+         }
+         // Two windows started with `auto` get two ports and two key files.
+-        let (_rx2, other) = start(AUTO, egui::Context::default(), Some(&dir)).unwrap();
++        let (_rx2, other) = start(AUTO, egui::Context::default(), Some(&dir), Arc::default()).unwrap();
+         let other = other.unwrap();
+         if deckcraft_control_key::instance_id().is_none() {
+             assert_ne!(other.path(), key_file.path());
+@@ -568,6 +595,39 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    /// A connection counts as a client from its first authorised request until it closes;
++    /// refused ones never count.
++    #[test]
++    fn authorised_connections_are_counted_while_open() {
++        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let clients = Arc::new(AtomicUsize::new(0));
++        let _rx = serve_on(listener, egui::Context::default(), KEY.to_string(), FIRST_REQUEST, clients.clone());
++        // The count changes on the connection's thread: wait for it a little.
++        let settle = |want: usize| {
++            let t0 = Instant::now();
++            while clients.load(Ordering::Relaxed) != want && t0.elapsed() < Duration::from_secs(5) {
++                std::thread::sleep(Duration::from_millis(10));
++            }
++            clients.load(Ordering::Relaxed)
++        };
++        let mut refused = Conn::open(port);
++        assert_eq!(refused.call(r#"{"id":1,"method":"auth","key":"nope"}"#)["error"], "unauthorized");
++        assert!(refused.closed());
++        assert_eq!(settle(0), 0, "a refused connection is not a client");
++        let mut a = Conn::open(port);
++        let quiet = Conn::open(port);
++        assert_eq!(a.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
++        assert_eq!(settle(1), 1, "only the authorised one counts");
++        let mut b = Conn::open(port);
++        assert_eq!(b.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
++        assert_eq!(settle(2), 2);
++        drop(a);
++        assert_eq!(settle(1), 1, "a closed connection stops counting");
++        drop((b, quiet));
++        assert_eq!(settle(0), 0);
++    }
++
+     #[test]
+     fn a_stale_key_file_is_replaced() {
+         let dir = temp_dir("stale");
+diff --git a/apps/deckcraft/src/main.rs b/apps/deckcraft/src/main.rs
+index a1ab548..e8086c4 100644
+--- a/apps/deckcraft/src/main.rs
++++ b/apps/deckcraft/src/main.rs
+@@ -70,7 +70,7 @@ fn config_dir() -> Option<std::path::PathBuf> {
+ /// Start the control server on `port` ([`control_server::AUTO`]: a free one) and hand its
+ /// requests to the app; its key file goes in `key_file`. Whether it started.
+ fn open_control(app: &mut SlideApp, port: u16, ctx: &egui::Context, key_file: &mut Option<control_server::KeyFile>) -> bool {
+-    let Some((rx, file)) = control_server::start(port, ctx.clone(), config_dir().as_deref()) else { return false };
++    let Some((rx, file)) = control_server::start(port, ctx.clone(), config_dir().as_deref(), app.control_clients.clone()) else { return false };
+     app.control_rx = Some(rx);
+     *key_file = file;
+     true
+diff --git a/crates/ui-egui/src/control.rs b/crates/ui-egui/src/control.rs
+index bf15d82..67826f7 100644
+--- a/crates/ui-egui/src/control.rs
++++ b/crates/ui-egui/src/control.rs
+@@ -79,6 +79,9 @@ pub fn inspect(app: &SlideApp, ctx: &egui::Context) -> Value {
+         "showing": app.show.as_ref().map(|s| json!({"slide": s.state.slide, "step": s.state.step, "ended": s.ended})),
+         "documents": app.session.documents().iter().map(|d| json!({"title": d.title(), "dirty": d.is_dirty(), "path": d.path})).collect::<Vec<_>>(),
+         "status": app.status.as_ref().map(|s| s.0.clone()),
++        // Open authorised control connections; the status bar says "Assistant connected" while
++        // there are any.
++        "controlClients": app.control_clients.load(std::sync::atomic::Ordering::Relaxed),
+         "perf": {"frameMs": app.perf.frame_ms, "renderMs": app.perf.render_ms, "fps": app.perf.fps},
+     })
+ }
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 79a70aa..6f734da 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -190,6 +190,10 @@ pub struct SlideApp {
+     pub ui: UiState,
+     pub textures: textures::Textures,
+     pub control_rx: Option<Receiver<ControlRequest>>,
++    /// Connections to the window's control channel that sent an authorised request and are still
++    /// open, counted by the host's control server: while there are any, the status bar says an
++    /// assistant is connected.
++    pub control_clients: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+     pub dialog: Option<dialogs::Dialog>,
+     pub show: Option<show::Show>,
+     /// Audio/video playback (editor control bar, slide show, `media.*` commands).
+@@ -245,6 +249,7 @@ impl SlideApp {
+             ui: UiState::default(),
+             textures: textures::Textures::default(),
+             control_rx: None,
++            control_clients: Default::default(),
+             dialog: None,
+             show: None,
+             media: media::MediaHost::new(audio_out),
+@@ -282,6 +287,11 @@ impl SlideApp {
+         self
+     }
+ 
++    /// An assistant is connected: an authorised connection to the control channel is open.
++    pub fn assistant_connected(&self) -> bool {
++        self.control_clients.load(std::sync::atomic::Ordering::Relaxed) > 0
++    }
++
+     pub fn set_status(&mut self, msg: impl Into<String>) {
+         self.status = Some((msg.into(), now_ms()));
+     }
+@@ -1194,6 +1204,31 @@ mod tests {
+         assert!(!harness.state().ui.allow_assistants, "and off again");
+     }
+ 
++    /// While the control server counts an authorised connection, the status bar says an
++    /// assistant is connected, and stops saying so when it closes.
++    #[test]
++    fn the_status_bar_shows_a_connected_assistant() {
++        use egui_kittest::kittest::Queryable;
++        let app = SlideApp::new(Session::with_new(), Services::default());
++        let clients = app.control_clients.clone();
++        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
++            |ui, app: &mut SlideApp| {
++                app.logic(ui.ctx());
++                app.ui(ui);
++            },
++            app,
++        );
++        harness.run_steps(2);
++        assert!(harness.query_by_label("Assistant connected").is_none(), "nobody connected");
++        clients.store(1, std::sync::atomic::Ordering::Relaxed);
++        harness.run_steps(2);
++        assert!(harness.state().assistant_connected());
++        assert!(harness.query_by_label("Assistant connected").is_some());
++        clients.store(0, std::sync::atomic::Ordering::Relaxed);
++        harness.run_steps(2);
++        assert!(harness.query_by_label("Assistant connected").is_none(), "gone when the connection closes");
++    }
++
+     fn title_text(app: &SlideApp) -> String {
+         let d = app.session.active().unwrap();
+         let sh = &d.doc.slides[0].shapes[0];
+diff --git a/crates/ui-egui/src/status.rs b/crates/ui-egui/src/status.rs
+index 8e915b7..f1e9bd2 100644
+--- a/crates/ui-egui/src/status.rs
++++ b/crates/ui-egui/src/status.rs
+@@ -30,9 +30,11 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
+                 app.status = None;
+             }
+         }
++        // Room for "Assistant connected" too while an assistant is connected.
++        let right_w = if app.assistant_connected() { 700.0 } else { 560.0 };
+         let mut right = ui.new_child(
+             egui::UiBuilder::new()
+-                .max_rect(Rect::from_min_max(pos2(rect.max.x - 560.0, rect.min.y), pos2(rect.max.x - 8.0, rect.max.y)))
++                .max_rect(Rect::from_min_max(pos2(rect.max.x - right_w, rect.min.y), pos2(rect.max.x - 8.0, rect.max.y)))
+                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
+         );
+         right.spacing_mut().item_spacing.x = 4.0;
+@@ -82,6 +84,14 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
+         if labeled(&mut right, Icon::NotesSmall, "Notes", n_on).clicked() {
+             app.ui.notes = !n_on;
+         }
++        // While an assistant is connected to the window's control channel (an authorised
++        // connection is open), say so, in the accent colour, so the user always knows.
++        if app.assistant_connected() {
++            right.add_space(8.0);
++            right.add(egui::Label::new(egui::RichText::new("Assistant connected").size(12.0).color(t.accent))).on_hover_text(
++                "An assistant is connected to this window through its control channel and can read and edit the presentation.",
++            );
++        }
+         let _ = Stroke::NONE;
+     });
+ }
+-- 
+2.52.0.windows.1
+

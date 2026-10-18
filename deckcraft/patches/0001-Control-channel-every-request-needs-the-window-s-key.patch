@@ -1,0 +1,1343 @@
+From b4dc18ea0e31560cc710bfa4e5f36761f5dd38c6 Mon Sep 17 00:00:00 2001
+From: Lovelace's Square <noreply@lovelacesquare.org>
+Date: Sun, 18 Oct 2026 10:19:58 +0200
+Subject: [PATCH 1/4] Control channel: every request needs the window's key
+
+The loopback control port took commands from anything that could reach
+it: any local program, and a web page's fetch() to 127.0.0.1 could
+smuggle a JSON line in a request body. This brings WordCraft's key
+scheme (WordCraft 0.7.0, docs/control-protocol.md "Keys") to DeckCraft.
+
+- control-key (new crate, shared by the app and the MCP bridge): the
+  settings folder and the key file's name, control-key.local-<port>, or
+  the Flatpak instance id inside Flatpak.
+- deckcraft: once the port is bound, the window writes a random 256-bit
+  key (getrandom) to <settings>/control-key.<instance> (mode 0600 on
+  Unix), and removes it when it closes. Every request needs it, as the
+  top-level `key` or once per connection with `auth`; it is compared in
+  constant time, and a missing or wrong key gets "unauthorized" and the
+  connection closed. A line that isn't JSON closes the connection (an
+  HTTP request can't carry a command), a connection with no authorised
+  request within 30 s is closed, and lines over 64 MiB are refused
+  (pictures and media can come inline as base64). The settings folder
+  now comes from the control-key crate (same paths as before).
+- mcp: Remote (deckcraft-cli mcp --connect and deckcraft-cli app) sends
+  the key from DECKCRAFT_CONTROL_KEY or the key file for the port, read
+  again on every new connection, and only to loopback addresses.
+- docs: control-protocol.md "Keys", mcp.md.
+
+Tests ported from WordCraft: control_server (refused and closed without
+or with a wrong key, auth once per connection, params.key, line limit,
+first-request deadline, bad JSON, HTTP smuggling, key file life cycle,
+stale key file), control-key, and the MCP bridge's key lookup and
+loopback-only sending.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Esdp3ZTPsHBV41yHxMJHnJ
+---
+ Cargo.lock                           |   7 +
+ Cargo.toml                           |   1 +
+ apps/deckcraft/Cargo.toml            |   4 +
+ apps/deckcraft/src/control_server.rs | 525 +++++++++++++++++++++++++--
+ apps/deckcraft/src/main.rs           |  34 +-
+ crates/control-key/Cargo.toml        |   9 +
+ crates/control-key/src/lib.rs        |  83 +++++
+ crates/mcp/Cargo.toml                |   2 +
+ crates/mcp/src/backend.rs            | 314 +++++++++++++++-
+ docs/control-protocol.md             |  45 ++-
+ docs/mcp.md                          |   4 +-
+ 11 files changed, 959 insertions(+), 69 deletions(-)
+ create mode 100644 crates/control-key/Cargo.toml
+ create mode 100644 crates/control-key/src/lib.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 4cf2cd8..253c4a1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -881,11 +881,13 @@ version = "0.7.0"
+ dependencies = [
+  "arboard",
+  "cpal",
++ "deckcraft-control-key",
+  "deckcraft-engine",
+  "deckcraft-media",
+  "deckcraft-ui-egui",
+  "eframe",
+  "egui",
++ "getrandom 0.3.4",
+  "image",
+  "log",
+  "rfd",
+@@ -935,6 +937,10 @@ dependencies = [
+  "serde",
+ ]
+ 
++[[package]]
++name = "deckcraft-control-key"
++version = "0.7.0"
++
+ [[package]]
+ name = "deckcraft-engine"
+ version = "0.7.0"
+@@ -1022,6 +1028,7 @@ version = "0.7.0"
+ name = "deckcraft-mcp"
+ version = "0.7.0"
+ dependencies = [
++ "deckcraft-control-key",
+  "deckcraft-engine",
+  "deckcraft-render",
+  "log",
+diff --git a/Cargo.toml b/Cargo.toml
+index 5bb1f9a..94c5bc9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -25,6 +25,7 @@ deckcraft-format = { path = "crates/format" }
+ deckcraft-anim = { path = "crates/anim" }
+ deckcraft-engine = { path = "crates/engine" }
+ deckcraft-mcp = { path = "crates/mcp" }
++deckcraft-control-key = { path = "crates/control-key" }
+ deckcraft-ui-egui = { path = "crates/ui-egui" }
+ deckcraft-media = { path = "crates/media" }
+ # codecs (ported from FilmCraft, same owner and licence)
+diff --git a/apps/deckcraft/Cargo.toml b/apps/deckcraft/Cargo.toml
+index 26ea308..43791a4 100644
+--- a/apps/deckcraft/Cargo.toml
++++ b/apps/deckcraft/Cargo.toml
+@@ -14,6 +14,8 @@ workspace = true
+ deckcraft-engine = { workspace = true }
+ deckcraft-ui-egui = { workspace = true }
+ deckcraft-media = { workspace = true }
++# The control key file's location (shared with the MCP bridge).
++deckcraft-control-key = { workspace = true }
+ eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "links", "wayland", "x11"] }
+ egui = { workspace = true }
+ serde_json = { workspace = true }
+@@ -28,6 +30,8 @@ rfd = { workspace = true }
+ arboard = { workspace = true, features = ["image-data"] }
+ image = { workspace = true }
+ cpal = "0.16"
++# The control channel's per-window key (32 random bytes from the operating system).
++getrandom = "0.3"
+ 
+ [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+ winit = { version = "0.30", default-features = false, features = ["x11"] }
+diff --git a/apps/deckcraft/src/control_server.rs b/apps/deckcraft/src/control_server.rs
+index f50de02..a0cf014 100644
+--- a/apps/deckcraft/src/control_server.rs
++++ b/apps/deckcraft/src/control_server.rs
+@@ -1,62 +1,527 @@
+ //! Loopback JSON-lines control server: one request per line, one reply per line.
+ //! This is the transport the MCP server (`deckcraft-cli mcp --connect`) wraps.
++//!
++//! Every request needs the window's key (`docs/control-protocol.md`, Keys): once the port is
++//! bound, the app writes a random key to `<settings>/control-key.<instance>` (mode 0600) and
++//! removes the file when the window closes.
+ 
+-use std::io::{BufRead, BufReader, Write};
++use std::io::{BufRead, BufReader, Read, Write};
+ use std::net::{TcpListener, TcpStream};
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
+ use std::sync::mpsc::{Receiver, Sender, channel};
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ use deckcraft_ui_egui::ControlRequest;
+ use serde_json::{Value, json};
+ 
+-pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
+-    let (tx, rx) = channel::<ControlRequest>();
++/// Longer request lines are refused (and the connection closed). Pictures and media can come
++/// inline as base64 (`insert.picture {data}`), so the limit is generous.
++const MAX_LINE: usize = 64 << 20;
++
++/// A connection that sends no authorised request in this time is closed.
++const FIRST_REQUEST: Duration = Duration::from_secs(30);
++
++/// The key file of a running control server; [`KeyFile::remove`] it when the window closes.
++pub struct KeyFile(PathBuf);
++
++impl KeyFile {
++    pub fn path(&self) -> &Path {
++        &self.0
++    }
++    pub fn remove(&self) {
++        let _ = std::fs::remove_file(&self.0);
++    }
++}
++
++/// Bind `127.0.0.1:port`, write the key file into `settings` and serve. `None` when the port
++/// cannot be bound or there is no random key (the control channel is off); the key file is
++/// `None` when it could not be written (requests are then refused).
++pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>) -> Option<(Receiver<ControlRequest>, Option<KeyFile>)> {
+     let listener = match TcpListener::bind(("127.0.0.1", port)) {
+         Ok(l) => l,
+         Err(e) => {
+             log::error!("control server failed to bind 127.0.0.1:{port}: {e}");
+-            return rx;
++            return None;
++        }
++    };
++    let key = match random_key() {
++        Ok(k) => k,
++        Err(e) => {
++            log::error!("control server off: no random key ({e})");
++            return None;
++        }
++    };
++    let key_file = match settings {
++        Some(dir) => {
++            let p = deckcraft_control_key::key_path(dir, port);
++            match write_key_file(&p, &key) {
++                Ok(()) => Some(KeyFile(p)),
++                Err(e) => {
++                    log::error!("control key file not written ({e}): requests will be refused");
++                    None
++                }
++            }
++        }
++        None => {
++            log::error!("no settings folder for the control key file: requests will be refused");
++            None
+         }
+     };
+-    log::info!("control server listening on 127.0.0.1:{port}");
++    match &key_file {
++        Some(f) => log::info!("control server listening on 127.0.0.1:{port}, key in {}", f.path().display()),
++        None => log::info!("control server listening on 127.0.0.1:{port}"),
++    }
++    Some((serve_on(listener, ctx, key, FIRST_REQUEST), key_file))
++}
++
++/// A new key: 32 random bytes from the operating system, as hex.
++fn random_key() -> Result<String, String> {
++    let mut b = [0u8; 32];
++    getrandom::fill(&mut b).map_err(|e| e.to_string())?;
++    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
++}
++
++/// Write the key file: a stale one (from a run that did not exit cleanly) is replaced; on Unix
++/// the new file is created with mode 0600.
++fn write_key_file(p: &Path, key: &str) -> Result<(), String> {
++    if let Some(d) = p.parent() {
++        std::fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
++    }
++    let _ = std::fs::remove_file(p);
++    let mut open = std::fs::OpenOptions::new();
++    open.write(true).create_new(true);
++    #[cfg(unix)]
++    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
++    let mut f = open.open(p).map_err(|e| format!("cannot create {}: {e}", p.display()))?;
++    f.write_all(key.as_bytes()).map_err(|e| format!("cannot write {}: {e}", p.display()))
++}
++
++/// Compare a key with the window's in time that does not depend on where they differ. An
++/// empty key never matches.
++fn keys_match(given: &str, key: &str) -> bool {
++    let (a, b) = (given.as_bytes(), key.as_bytes());
++    !b.is_empty() && a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
++}
++
++fn serve_on(listener: TcpListener, ctx: egui::Context, key: String, first: Duration) -> Receiver<ControlRequest> {
++    let (tx, rx) = channel::<ControlRequest>();
++    let key: Arc<str> = key.into();
+     std::thread::spawn(move || {
+         for stream in listener.incoming().flatten() {
+-            let tx = tx.clone();
+-            let ctx = ctx.clone();
+-            std::thread::spawn(move || serve(stream, tx, ctx));
++            let (tx, ctx, key) = (tx.clone(), ctx.clone(), key.clone());
++            std::thread::spawn(move || serve(stream, tx, ctx, &key, first));
+         }
+     });
+     rx
+ }
+ 
+-fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context) {
++/// The read side of a connection with an optional overall deadline: each read waits only for
++/// the time left, so blank lines, bad JSON or a slow drip of bytes cannot extend it.
++struct Timed {
++    s: TcpStream,
++    deadline: Option<Instant>,
++}
++
++impl Read for Timed {
++    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++        if let Some(d) = self.deadline {
++            let left = d.checked_duration_since(Instant::now()).filter(|l| !l.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
++            self.s.set_read_timeout(Some(left))?;
++        }
++        self.s.read(buf)
++    }
++}
++
++impl Timed {
++    fn set_deadline(&mut self, d: Option<Instant>) {
++        self.deadline = d;
++        if d.is_none() {
++            let _ = self.s.set_read_timeout(None);
++        }
++    }
++}
++
++/// The next line (trimmed), `None` at the end of the stream or after a read error.
++fn read_line(r: &mut BufReader<Timed>) -> Option<Result<String, &'static str>> {
++    let mut buf = Vec::new();
++    let n = r.by_ref().take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf).ok()?;
++    if n == 0 {
++        return None;
++    }
++    if buf.len() > MAX_LINE {
++        return Some(Err("line too long"));
++    }
++    Some(String::from_utf8(buf).map(|s| s.trim().to_string()).map_err(|_| "not UTF-8"))
++}
++
++/// Read and drop the rest of an oversize line, so closing the socket does not reset the
++/// connection before the client has read the error. At most 64 MiB, within 2 s.
++fn discard_rest_of_line(r: &mut BufReader<Timed>) {
++    r.get_mut().set_deadline(Some(Instant::now() + Duration::from_secs(2)));
++    let mut left: usize = 64 << 20;
++    while left > 0 {
++        let (used, done) = match r.fill_buf() {
++            Ok([]) | Err(_) => return,
++            Ok(b) => match b.iter().position(|&c| c == b'\n') {
++                Some(i) => (i + 1, true),
++                None => (b.len(), false),
++            },
++        };
++        r.consume(used);
++        if done {
++            return;
++        }
++        left = left.saturating_sub(used);
++    }
++}
++
++fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key: &str, first: Duration) {
+     let Ok(read) = stream.try_clone() else { return };
+     let mut out = stream;
+-    for line in BufReader::new(read).lines() {
+-        let Ok(line) = line else { break };
+-        if line.trim().is_empty() {
++    // One overall deadline from accept to the first authorised request; after it, none.
++    let mut reader = BufReader::new(Timed { s: read, deadline: Some(Instant::now() + first) });
++    let mut authorised = false;
++    // The key an `auth` request gave this connection.
++    let mut conn_key: Option<String> = None;
++    while let Some(line) = read_line(&mut reader) {
++        let line = match line {
++            Ok(l) => l,
++            Err(e) => {
++                let _ = writeln!(out, "{}", json!({"ok": false, "error": e}));
++                if e == "line too long" {
++                    discard_rest_of_line(&mut reader);
++                }
++                break;
++            }
++        };
++        if line.is_empty() {
+             continue;
+         }
+-        let reply = match serde_json::from_str::<Value>(&line) {
+-            Ok(msg) => {
+-                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+-                let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+-                let params = msg.get("params").cloned().unwrap_or(json!({}));
+-                let (req, rrx) = ControlRequest::new(method, params);
+-                if tx.send(req).is_err() {
+-                    break;
+-                }
+-                ctx.request_repaint();
+-                let mut r = rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"}));
+-                if let Some(o) = r.as_object_mut() {
+-                    o.insert("id".into(), id);
+-                }
+-                r
++        let msg = match serde_json::from_str::<Value>(&line) {
++            Ok(m) => m,
++            // Close on a line that isn't JSON: an HTTP request (say, a web page's `fetch` to this
++            // port) starts with a request line that never parses, so it can't carry a command in
++            // its body, even before the key is checked.
++            Err(e) => {
++                let _ = writeln!(out, "{}", json!({"ok": false, "error": format!("bad JSON: {e}; closing the connection")}));
++                break;
++            }
++        };
++        let id = msg.get("id").cloned().unwrap_or(Value::Null);
++        let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
++        let params = msg.get("params").cloned().unwrap_or(json!({}));
++        // The top-level `key`; `auth` may carry it in its params. For other methods `params.key`
++        // is an ordinary parameter (`ui.key {"key": "Enter"}`).
++        let given =
++            msg.get("key").and_then(Value::as_str).or_else(|| if method == "auth" { params.get("key").and_then(Value::as_str) } else { None });
++        let mut reply = |mut v: Value| -> bool {
++            if let Some(o) = v.as_object_mut() {
++                o.insert("id".into(), id.clone());
+             }
+-            Err(e) => json!({"ok": false, "error": format!("bad JSON: {e}")}),
++            writeln!(out, "{v}").is_ok()
+         };
+-        if writeln!(out, "{reply}").is_err() {
++        // Checked on every request.
++        let k = given.or(conn_key.as_deref()).unwrap_or("");
++        if !keys_match(k, key) {
++            let _ = reply(json!({"ok": false, "error": "unauthorized"}));
++            break;
++        }
++        if !authorised {
++            authorised = true;
++            reader.get_mut().set_deadline(None);
++        }
++        if method == "auth" {
++            conn_key = Some(k.to_string());
++            if !reply(json!({"ok": true, "result": {}})) {
++                break;
++            }
++            continue;
++        }
++        let (req, rrx) = ControlRequest::new(method, params);
++        if tx.send(req).is_err() {
+             break;
+         }
++        ctx.request_repaint();
++        let r = rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"}));
++        if !reply(r) {
++            break;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::{BufRead, BufReader, Write};
++    use std::net::TcpStream;
++
++    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
++
++    fn boot_with(first: Duration) -> (u16, Receiver<ControlRequest>) {
++        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let port = listener.local_addr().unwrap().port();
++        (port, serve_on(listener, egui::Context::default(), KEY.to_string(), first))
++    }
++
++    fn boot() -> (u16, Receiver<ControlRequest>) {
++        boot_with(FIRST_REQUEST)
++    }
++
++    /// Answer the next request that reaches the UI with `ok`, and return it.
++    fn answer(rx: &Receiver<ControlRequest>) -> ControlRequest {
++        let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
++        let _ = req.reply.send(json!({"ok": true, "result": {}}));
++        req
++    }
++
++    /// One connection, several lines.
++    struct Conn(BufReader<TcpStream>, TcpStream);
++
++    impl Conn {
++        fn open(port: u16) -> Self {
++            let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
++            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
++            Self(BufReader::new(s.try_clone().unwrap()), s)
++        }
++        fn send(&mut self, line: &str) {
++            writeln!(self.1, "{line}").unwrap();
++        }
++        fn recv(&mut self) -> Value {
++            let mut r = String::new();
++            let _ = self.0.read_line(&mut r);
++            serde_json::from_str(&r).unwrap_or_default()
++        }
++        fn call(&mut self, line: &str) -> Value {
++            self.send(line);
++            self.recv()
++        }
++        /// The server closed the connection.
++        fn closed(&mut self) -> bool {
++            let mut r = String::new();
++            matches!(self.0.read_line(&mut r), Ok(0))
++        }
++    }
++
++    #[test]
++    fn a_request_without_the_key_is_refused_and_closed() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        let r = c.call(r#"{"id":1,"method":"document.inspect"}"#);
++        assert_eq!((r["ok"].clone(), r["error"].clone(), r["id"].clone()), (json!(false), json!("unauthorized"), json!(1)));
++        assert!(c.closed());
++        assert!(rx.try_recv().is_err(), "nothing reached the UI");
++    }
++
++    #[test]
++    fn a_wrong_key_is_refused_and_closed() {
++        let (port, rx) = boot();
++        for key in ["nope", &KEY[..63], &format!("{KEY}0"), &KEY.to_uppercase()] {
++            let mut c = Conn::open(port);
++            assert_eq!(c.call(&format!(r#"{{"id":1,"key":"{key}","method":"document.inspect"}}"#))["error"], "unauthorized", "{key}");
++            assert!(c.closed());
++        }
++        assert!(rx.try_recv().is_err());
++    }
++
++    #[test]
++    fn the_key_on_each_request() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        c.send(&format!(r#"{{"id":7,"key":"{KEY}","method":"document.inspect","params":{{"text":true}}}}"#));
++        let req = answer(&rx);
++        assert_eq!((req.method.as_str(), &req.params), ("document.inspect", &json!({"text": true})));
++        let r = c.recv();
++        assert_eq!((r["ok"].clone(), r["id"].clone()), (json!(true), json!(7)));
++        // Every request needs it: one without the key is refused, also after good ones.
++        assert_eq!(c.call(r#"{"id":8,"method":"document.inspect"}"#)["error"], "unauthorized");
++        assert!(c.closed());
++    }
++
++    #[test]
++    fn auth_once_per_connection() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        assert_eq!(c.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
++        for id in 2..4 {
++            c.send(&format!(r#"{{"id":{id},"method":"document.inspect"}}"#));
++            answer(&rx);
++            assert_eq!(c.recv()["ok"], true);
++        }
++        // `params.key` works for `auth` too.
++        let mut c = Conn::open(port);
++        assert_eq!(c.call(&format!(r#"{{"id":1,"method":"auth","params":{{"key":"{KEY}"}}}}"#))["ok"], true);
++        // A wrong key on an authenticated connection is still refused, and closes it.
++        assert_eq!(c.call(r#"{"id":2,"key":"nope","method":"document.inspect"}"#)["error"], "unauthorized");
++        assert!(c.closed());
++        // A failed auth closes the connection.
++        let mut c = Conn::open(port);
++        assert_eq!(c.call(r#"{"id":1,"method":"auth","key":"nope"}"#)["error"], "unauthorized");
++        assert!(c.closed());
++    }
++
++    #[test]
++    fn params_key_is_only_a_secret_for_auth() {
++        let (port, rx) = boot();
++        // `params.key` does not authenticate other methods.
++        let mut c = Conn::open(port);
++        assert_eq!(c.call(&format!(r#"{{"id":1,"method":"document.inspect","params":{{"key":"{KEY}"}}}}"#))["error"], "unauthorized");
++        // It is an ordinary parameter for them (`ui.key` presses a key).
++        let mut c = Conn::open(port);
++        c.send(&format!(r#"{{"id":1,"key":"{KEY}","method":"ui.key","params":{{"key":"Enter"}}}}"#));
++        let req = answer(&rx);
++        assert_eq!((req.method.as_str(), &req.params), ("ui.key", &json!({"key": "Enter"})));
++        assert_eq!(c.recv()["ok"], true);
++    }
++
++    #[test]
++    fn a_line_over_the_limit_is_refused_and_closed() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        let big = format!(r#"{{"id":1,"key":"{KEY}","method":"document.inspect","pad":"{}"}}"#, "x".repeat(MAX_LINE));
++        assert_eq!(c.call(&big)["error"], "line too long");
++        assert!(c.closed());
++        assert!(rx.try_recv().is_err());
++    }
++
++    #[test]
++    fn a_silent_connection_is_closed() {
++        let (port, rx) = boot_with(Duration::from_millis(300));
++        let mut quiet = Conn::open(port);
++        let t0 = Instant::now();
++        assert!(quiet.closed());
++        assert!(t0.elapsed() < Duration::from_secs(3));
++        // After an authorised request the connection may stay idle.
++        let mut busy = Conn::open(port);
++        assert_eq!(busy.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
++        std::thread::sleep(Duration::from_millis(600));
++        busy.send(r#"{"id":2,"method":"document.inspect"}"#);
++        answer(&rx);
++        assert_eq!(busy.recv()["ok"], true);
++    }
++
++    #[test]
++    fn the_first_request_limit_is_one_overall_deadline() {
++        // Blank lines and bad JSON do not keep a connection without the key open.
++        let (port, _rx) = boot_with(Duration::from_millis(300));
++        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
++        let mut w = s.try_clone().unwrap();
++        let feeder = std::thread::spawn(move || {
++            for i in 0..40 {
++                if w.write_all(if i % 2 == 0 { b"\n" } else { b"not json\n" }).is_err() {
++                    return;
++                }
++                std::thread::sleep(Duration::from_millis(50));
++            }
++        });
++        let t0 = Instant::now();
++        let mut r = BufReader::new(s);
++        r.get_ref().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
++        let mut line = String::new();
++        loop {
++            line.clear();
++            if matches!(r.read_line(&mut line), Ok(0) | Err(_)) {
++                break;
++            }
++            assert!(line.contains("bad JSON"), "{line}");
++        }
++        let _ = feeder.join();
++        assert!(t0.elapsed() < Duration::from_millis(1500), "{:?}", t0.elapsed());
++    }
++
++    #[test]
++    fn bad_json_closes_the_connection() {
++        let (port, rx) = boot();
++        let mut c = Conn::open(port);
++        assert_eq!(c.call("not json")["ok"], false);
++        assert!(c.closed());
++        assert!(rx.try_recv().is_err());
++    }
++
++    #[test]
++    fn http_request_cannot_smuggle_a_command() {
++        // What a web page's `fetch("http://127.0.0.1:<port>/", {method: "POST", body})` sends,
++        // even with the key in the body.
++        let (port, rx) = boot();
++        let body = format!("\n{{\"key\":\"{KEY}\",\"method\":\"file.saveAs\",\"params\":{{\"path\":\"/tmp/x.docx\"}}}}\n");
++        let req = format!("POST / HTTP/1.1\r\nHost: 127.0.0.1:7979\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}", body.len());
++        let mut c = Conn::open(port);
++        c.1.write_all(req.as_bytes()).unwrap();
++        let _ = c.recv();
++        assert!(c.closed());
++        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
++    }
++
++    #[test]
++    fn keys_compare_whole() {
++        assert!(keys_match(KEY, KEY));
++        assert!(!keys_match(KEY, &KEY[..63]));
++        assert!(!keys_match(&KEY[..63], KEY));
++        assert!(!keys_match(KEY, &KEY.replace('f', "e")));
++        assert!(!keys_match("", ""), "an empty key never matches");
++    }
++
++    #[test]
++    fn random_keys_are_256_bits() {
++        let (a, b) = (random_key().unwrap(), random_key().unwrap());
++        assert_eq!(a.len(), 64);
++        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
++        assert_ne!(a, b);
++    }
++
++    fn temp_dir(name: &str) -> std::path::PathBuf {
++        let dir = std::env::temp_dir().join(format!("deckcraft-control-{name}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        dir
++    }
++
++    #[test]
++    fn the_key_file_is_written_after_the_bind_and_removed_on_exit() {
++        let dir = temp_dir("life");
++        // The port is taken: no key file.
++        let taken = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let port = taken.local_addr().unwrap().port();
++        assert!(start(port, egui::Context::default(), Some(&dir)).is_none());
++        assert!(!dir.exists() || std::fs::read_dir(&dir).unwrap().next().is_none(), "no key file after a failed bind");
++        drop(taken);
++        // Bound: the key file holds the key that opens the port.
++        let (rx, key_file) = start(port, egui::Context::default(), Some(&dir)).unwrap();
++        let key_file = key_file.unwrap();
++        assert_eq!(key_file.path(), deckcraft_control_key::key_path(&dir, port));
++        let key = std::fs::read_to_string(key_file.path()).unwrap();
++        assert_eq!(key.len(), 64);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            assert_eq!(std::fs::metadata(key_file.path()).unwrap().permissions().mode() & 0o777, 0o600);
++        }
++        let mut c = Conn::open(port);
++        c.send(&format!(r#"{{"id":1,"key":"{key}","method":"document.inspect"}}"#));
++        answer(&rx);
++        assert_eq!(c.recv()["ok"], true);
++        key_file.remove();
++        assert!(!key_file.path().exists());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn a_stale_key_file_is_replaced() {
++        let dir = temp_dir("stale");
++        std::fs::create_dir_all(&dir).unwrap();
++        let p = dir.join("control-key.test");
++        std::fs::write(&p, "old").unwrap();
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
++        }
++        write_key_file(&p, KEY).unwrap();
++        assert_eq!(std::fs::read_to_string(&p).unwrap(), KEY);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
++        }
++        let _ = std::fs::remove_dir_all(&dir);
+     }
+ }
+diff --git a/apps/deckcraft/src/main.rs b/apps/deckcraft/src/main.rs
+index 7b5e48b..f299731 100644
+--- a/apps/deckcraft/src/main.rs
++++ b/apps/deckcraft/src/main.rs
+@@ -3,8 +3,9 @@
+ //! Usage: `deckcraft [--control <port>] [--sample] [--show] [files…]`
+ //!
+ //! `--control <port>` (or `DECKCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server:
+-//! `{"id":1,"method":"ui.inspect","params":{}}` → `{"id":1,"ok":true,"result":…}`.
+-//! See `deckcraft_ui_egui::control` for the methods.
++//! `{"id":1,"key":"…","method":"ui.inspect","params":{}}` → `{"id":1,"ok":true,"result":…}`.
++//! Every request needs the key the app writes to `<settings>/control-key.<instance>` (mode 0600,
++//! removed on exit). See `deckcraft_ui_egui::control` and `docs/control-protocol.md`.
+ //!
+ //! `log` records go to standard error and `<settings dir>/logs/deckcraft.log` (`RUST_LOG` sets the
+ //! levels); see [`logging`].
+@@ -21,7 +22,8 @@ mod logging;
+ use deckcraft_engine::Session;
+ use deckcraft_ui_egui::{Services, SlideApp};
+ 
+-struct App(SlideApp);
++/// The app and the control server's key file (removed on exit).
++struct App(SlideApp, Option<control_server::KeyFile>);
+ 
+ impl eframe::App for App {
+     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+@@ -35,21 +37,16 @@ impl eframe::App for App {
+     }
+     fn on_exit(&mut self) {
+         save_prefs(&self.0);
++        if let Some(key_file) = &self.1 {
++            key_file.remove();
++        }
+     }
+ }
+ 
+-/// The per-user settings directory: `ui.json`, `prefs.json` and `logs/` live here.
++/// The per-user settings directory: `ui.json`, `prefs.json`, `logs/` and the control key files
++/// live here.
+ fn config_dir() -> Option<std::path::PathBuf> {
+-    if cfg!(target_os = "macos") {
+-        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library/Application Support/DeckCraft"))
+-    } else if cfg!(windows) {
+-        std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("DeckCraft"))
+-    } else {
+-        std::env::var_os("XDG_CONFIG_HOME")
+-            .map(std::path::PathBuf::from)
+-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+-            .map(|c| c.join("deckcraft"))
+-    }
++    deckcraft_control_key::settings_dir()
+ }
+ 
+ fn prefs_path() -> Option<std::path::PathBuf> {
+@@ -209,9 +206,12 @@ fn main() -> eframe::Result {
+                 }
+             }
+             app.integrated_titlebar = cfg!(target_os = "macos");
+-            if let Some(port) = control_port {
+-                let rx = control_server::start(port, cc.egui_ctx.clone());
++            let mut key_file = None;
++            if let Some(port) = control_port
++                && let Some((rx, file)) = control_server::start(port, cc.egui_ctx.clone(), config_dir().as_deref())
++            {
+                 app = app.with_control(rx);
++                key_file = file;
+             }
+             if sample && let Err(e) = deckcraft_engine::sample::open_sample(&mut app.session) {
+                 log::error!("sample: {e}");
+@@ -224,7 +224,7 @@ fn main() -> eframe::Result {
+             if show {
+                 app.start_show(0, false);
+             }
+-            Ok(Box::new(App(app)))
++            Ok(Box::new(App(app, key_file)))
+         }),
+     )
+ }
+diff --git a/crates/control-key/Cargo.toml b/crates/control-key/Cargo.toml
+new file mode 100644
+index 0000000..07eb695
+--- /dev/null
++++ b/crates/control-key/Cargo.toml
+@@ -0,0 +1,9 @@
++[package]
++name = "deckcraft-control-key"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++description = "DeckCraft control-port key file: where it lives and how to read it (shared by the app and the MCP bridge)"
++
++[lints]
++workspace = true
+diff --git a/crates/control-key/src/lib.rs b/crates/control-key/src/lib.rs
+new file mode 100644
+index 0000000..22e0495
+--- /dev/null
++++ b/crates/control-key/src/lib.rs
+@@ -0,0 +1,83 @@
++//! The control channel's key file, one rule for the app (which writes it) and the MCP bridge
++//! (which reads it): `<settings>/control-key.<instance>`. See `docs/control-protocol.md`, Keys.
++
++use std::path::{Path, PathBuf};
++
++/// The app's settings folder (preferences, logs, key files): macOS
++/// `~/Library/Application Support/DeckCraft`, Windows `%APPDATA%\DeckCraft`, otherwise
++/// `$XDG_CONFIG_HOME/deckcraft` or `~/.config/deckcraft`.
++pub fn settings_dir() -> Option<PathBuf> {
++    if cfg!(target_os = "macos") {
++        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/DeckCraft"))
++    } else if cfg!(windows) {
++        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("DeckCraft"))
++    } else {
++        std::env::var_os("XDG_CONFIG_HOME")
++            .map(PathBuf::from)
++            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
++            .map(|c| c.join("deckcraft"))
++    }
++}
++
++/// The `instance-id=` value of a `/.flatpak-info` file, only when it is `[A-Za-z0-9_-]+` (it
++/// becomes part of a file name).
++pub fn parse_instance_id(info: &str) -> Option<String> {
++    let v = info.lines().find_map(|l| l.strip_prefix("instance-id="))?.trim();
++    (!v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')).then(|| v.to_string())
++}
++
++/// The Flatpak instance id, or `None` outside Flatpak.
++pub fn instance_id() -> Option<String> {
++    parse_instance_id(&std::fs::read_to_string("/.flatpak-info").ok()?)
++}
++
++/// `<settings>/control-key.<instance>`, with `<instance>` the Flatpak instance id or
++/// `local-<port>`.
++pub fn key_path(settings: &Path, port: u16) -> PathBuf {
++    key_path_for(settings, instance_id().as_deref(), port)
++}
++
++fn key_path_for(settings: &Path, instance: Option<&str>, port: u16) -> PathBuf {
++    match instance {
++        Some(id) => settings.join(format!("control-key.{id}")),
++        None => settings.join(format!("control-key.local-{port}")),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::path::Path;
++
++    #[test]
++    fn instance_id_only_safe_values() {
++        assert_eq!(parse_instance_id("[Instance]\ninstance-id=abc_123-X\n").as_deref(), Some("abc_123-X"));
++        assert_eq!(parse_instance_id("instance-id= 42 \n").as_deref(), Some("42"));
++        // It ends up in a file name.
++        assert_eq!(parse_instance_id("instance-id=../etc\n"), None);
++        assert_eq!(parse_instance_id("instance-id=a/b\n"), None);
++        assert_eq!(parse_instance_id("instance-id=a b\n"), None);
++        assert_eq!(parse_instance_id("instance-id=..\n"), None);
++        assert_eq!(parse_instance_id("instance-id=\n"), None);
++        assert_eq!(parse_instance_id("app=ai.storyteller.deckcraft\n"), None);
++    }
++
++    #[test]
++    fn key_file_per_instance() {
++        let dir = Path::new("/settings/deckcraft");
++        assert_eq!(key_path_for(dir, Some("1234"), 7979), dir.join("control-key.1234"));
++        assert_eq!(key_path_for(dir, None, 7979), dir.join("control-key.local-7979"));
++        assert_eq!(key_path_for(dir, None, 7982), dir.join("control-key.local-7982"));
++        if instance_id().is_none() {
++            assert_eq!(key_path(dir, 7979), dir.join("control-key.local-7979"));
++        }
++    }
++
++    #[test]
++    fn settings_dir_is_the_apps_folder() {
++        if let Some(d) = settings_dir() {
++            let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
++            assert!(name == "deckcraft" || name == "DeckCraft", "{}", d.display());
++        }
++    }
++}
+diff --git a/crates/mcp/Cargo.toml b/crates/mcp/Cargo.toml
+index ab2efad..29ee061 100644
+--- a/crates/mcp/Cargo.toml
++++ b/crates/mcp/Cargo.toml
+@@ -11,5 +11,7 @@ workspace = true
+ [dependencies]
+ deckcraft-engine = { workspace = true }
+ deckcraft-render = { workspace = true }
++# Where the app writes its control key (`--connect` reads it).
++deckcraft-control-key = { workspace = true }
+ serde_json = { workspace = true }
+ log = { workspace = true }
+diff --git a/crates/mcp/src/backend.rs b/crates/mcp/src/backend.rs
+index f368654..35766e8 100644
+--- a/crates/mcp/src/backend.rs
++++ b/crates/mcp/src/backend.rs
+@@ -1,7 +1,8 @@
+ //! Where MCP tool calls end up: a control-channel method call.
+ 
+ use std::io::{BufRead, BufReader, Write};
+-use std::net::{TcpStream, ToSocketAddrs};
++use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
++use std::path::Path;
+ use std::time::Duration;
+ 
+ use serde_json::{Value, json};
+@@ -17,18 +18,76 @@ pub trait Backend {
+     fn describe(&self) -> String;
+ }
+ 
++/// Looks up the control key for an address (`HOST:PORT`).
++type KeyFinder = Box<dyn Fn(&str) -> Result<String, String> + Send>;
++
+ /// A running DeckCraft app, reached through its loopback control port.
+ pub struct Remote {
+     addr: String,
+     conn: Option<(BufReader<TcpStream>, TcpStream)>,
+     next_id: u64,
++    /// The connection leads to a loopback address: requests carry the control key.
++    send_key: bool,
++    /// The control key, looked up once per connection (the app picks a new one at every start).
++    key: Option<String>,
++    find_key: KeyFinder,
++}
++
++/// The control key: `env` (`DECKCRAFT_CONTROL_KEY`) when set, else the app's key file for
++/// `port` in `settings`. The error says where it looked.
++fn lookup_key(env: Option<String>, settings: Option<&Path>, port: Option<u16>) -> Result<String, String> {
++    if let Some(k) = env.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
++        return Ok(k);
++    }
++    let (Some(settings), Some(port)) = (settings, port) else {
++        return Err("no control key: set DECKCRAFT_CONTROL_KEY (no settings folder or port to find the key file)".to_string());
++    };
++    let path = deckcraft_control_key::key_path(settings, port);
++    match std::fs::read_to_string(&path).map(|k| k.trim().to_string()) {
++        Ok(k) if !k.is_empty() => Ok(k),
++        _ => Err(format!("no control key: set DECKCRAFT_CONTROL_KEY, or start the app with --control {port} (it writes {})", path.display())),
++    }
++}
++
++/// The key for the app at `addr`, from the environment or the app's key file.
++fn find_key(addr: &str) -> Result<String, String> {
++    let port = addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok());
++    lookup_key(std::env::var("DECKCRAFT_CONTROL_KEY").ok(), deckcraft_control_key::settings_dir().as_deref(), port)
++}
++
++/// Whether `addr` (`HOST:PORT`, as given to `--connect`) names a loopback address: 127.0.0.0/8,
++/// ::1 or `localhost`. Other host names are not resolved: they never count.
++fn is_loopback_addr(addr: &str) -> bool {
++    let loopback = |ip: IpAddr| ip.to_canonical().is_loopback();
++    if let Ok(sa) = addr.parse::<SocketAddr>() {
++        return loopback(sa.ip());
++    }
++    if let Ok(ip) = addr.parse::<IpAddr>() {
++        return loopback(ip);
++    }
++    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
++    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
++    host.parse::<IpAddr>().map_or_else(|_| host.eq_ignore_ascii_case("localhost"), loopback)
++}
++
++/// The key goes only to a loopback `--connect` address, and only when the connection really
++/// leads to one (`peer`, so a `localhost` that resolves elsewhere gets no key either).
++fn may_send_key(addr: &str, peer: Option<SocketAddr>) -> bool {
++    is_loopback_addr(addr) && peer.is_some_and(|p| p.ip().to_canonical().is_loopback())
+ }
+ 
+ impl Remote {
+     /// Connect to `addr` (`127.0.0.1:7979`), failing fast when nothing is listening.
+     pub fn connect(addr: &str) -> std::io::Result<Self> {
+-        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1 };
++        Self::connect_with(addr, Box::new(find_key))
++    }
++
++    fn connect_with(addr: &str, find_key: KeyFinder) -> std::io::Result<Self> {
++        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1, send_key: false, key: None, find_key };
+         r.reconnect()?;
++        if let Some(w) = r.key_warning() {
++            log::warn!("{w}");
++        }
+         Ok(r)
+     }
+ 
+@@ -36,8 +95,19 @@ impl Remote {
+         &self.addr
+     }
+ 
++    /// Why requests go without the control key (the address is not loopback), if they do.
++    pub fn key_warning(&self) -> Option<String> {
++        (!self.send_key).then(|| {
++            format!(
++                "{} is not a loopback address, so the control key is not sent (it only goes to 127.0.0.0/8, ::1 and localhost) and the app refuses requests; reach the app through 127.0.0.1, for example with an SSH tunnel",
++                self.addr
++            )
++        })
++    }
++
+     fn reconnect(&mut self) -> std::io::Result<()> {
+         self.conn = None;
++        self.key = None;
+         let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, format!("cannot resolve {}", self.addr));
+         for sa in self.addr.to_socket_addrs()? {
+             match TcpStream::connect_timeout(&sa, Duration::from_millis(800)) {
+@@ -45,6 +115,7 @@ impl Remote {
+                     s.set_nodelay(true).ok();
+                     // The app answers within 60 s (its own timeout); leave headroom.
+                     s.set_read_timeout(Some(Duration::from_secs(90))).ok();
++                    self.send_key = may_send_key(&self.addr, s.peer_addr().ok());
+                     let read = s.try_clone()?;
+                     self.conn = Some((BufReader::new(read), s));
+                     return Ok(());
+@@ -55,10 +126,22 @@ impl Remote {
+         Err(last)
+     }
+ 
+-    fn roundtrip(&mut self, line: &str) -> std::io::Result<String> {
+-        if self.conn.is_none() {
+-            self.reconnect()?;
++    /// The request line; it carries the key when this connection may (looked up once per
++    /// connection).
++    fn request_line(&mut self, id: u64, method: &str, params: &Value) -> Result<String, String> {
++        let mut req = json!({"id": id, "method": method, "params": params});
++        if self.send_key {
++            let key = match &self.key {
++                Some(k) => k.clone(),
++                None => (self.find_key)(&self.addr)?,
++            };
++            req["key"] = json!(key);
++            self.key = Some(key);
+         }
++        Ok(req.to_string())
++    }
++
++    fn roundtrip(&mut self, line: &str) -> std::io::Result<String> {
+         let Some((reader, writer)) = self.conn.as_mut() else {
+             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected"));
+         };
+@@ -71,27 +154,61 @@ impl Remote {
+         }
+         Ok(reply)
+     }
++
++    /// One request and its reply, with one retry on a new connection (the app may have
++    /// restarted; a new connection also reads the key again).
++    fn exchange(&mut self, id: u64, method: &str, params: &Value) -> Result<Value, String> {
++        let unreachable = |addr: &str, e: std::io::Error| format!("DeckCraft app at {addr} is not reachable: {e}");
++        let mut first = true;
++        let reply = loop {
++            let tried = if self.conn.is_some() { Ok(()) } else { self.reconnect() };
++            let result = match tried {
++                Ok(()) => {
++                    let line = self.request_line(id, method, params)?;
++                    self.roundtrip(&line)
++                }
++                Err(e) => Err(e),
++            };
++            match result {
++                Ok(r) => break r,
++                Err(e) => {
++                    self.conn = None;
++                    if !first {
++                        return Err(unreachable(&self.addr, e));
++                    }
++                    first = false;
++                }
++            }
++        };
++        serde_json::from_str(reply.trim()).map_err(|e| format!("bad reply from app: {e}"))
++    }
+ }
+ 
+ impl Backend for Remote {
+     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+         let id = self.next_id;
+         self.next_id += 1;
+-        let line = json!({"id": id, "method": method, "params": params}).to_string();
+-        // One retry with a fresh connection (the app may have restarted).
+-        let reply = match self.roundtrip(&line) {
+-            Ok(r) => r,
+-            Err(_) => {
+-                self.conn = None;
+-                self.roundtrip(&line).map_err(|e| {
+-                    self.conn = None;
+-                    format!("DeckCraft app at {} is not reachable: {e}", self.addr)
+-                })?
+-            }
+-        };
+-        let v: Value = serde_json::from_str(reply.trim()).map_err(|e| format!("bad reply from app: {e}"))?;
++        let unauthorized = |v: &Value| v.get("error").and_then(Value::as_str) == Some("unauthorized");
++        let mut v = self.exchange(id, method, &params)?;
++        if unauthorized(&v) && self.send_key {
++            // A stale key (the app restarted on this port): the app closed the connection; a new
++            // one reads the key again. Once.
++            self.conn = None;
++            v = self.exchange(id, method, &params)?;
++        }
+         if v.get("ok").and_then(Value::as_bool) == Some(true) {
+             Ok(v.get("result").cloned().unwrap_or(Value::Null))
++        } else if unauthorized(&v) {
++            self.conn = None;
++            Err(self.key_warning().map_or_else(
++                || {
++                    format!(
++                        "unauthorized: the DeckCraft app at {} refused the control key (from DECKCRAFT_CONTROL_KEY or the app's key file)",
++                        self.addr
++                    )
++                },
++                |w| format!("unauthorized: {w}"),
++            ))
+         } else {
+             Err(v.get("error").and_then(Value::as_str).unwrap_or("unknown error").to_string())
+         }
+@@ -105,3 +222,164 @@ impl Backend for Remote {
+         format!("connected to the DeckCraft app at {}", self.addr)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::net::{SocketAddr, TcpListener};
++    use std::sync::Arc;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::sync::mpsc::{Receiver, channel};
++
++    #[test]
++    fn key_from_env_then_key_file() {
++        let dir = std::env::temp_dir().join(format!("deckcraft-mcp-key-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = deckcraft_control_key::key_path(&dir, 7979);
++        // Neither: the error names the variable and the file it looked for.
++        let e = lookup_key(None, Some(&dir), Some(7979)).unwrap_err();
++        assert!(e.contains("DECKCRAFT_CONTROL_KEY") && e.contains(&path.display().to_string()), "{e}");
++        // The key file, trimmed; an empty variable does not count.
++        std::fs::write(&path, "  file-key\n").unwrap();
++        assert_eq!(lookup_key(None, Some(&dir), Some(7979)).unwrap(), "file-key");
++        assert_eq!(lookup_key(Some(" ".into()), Some(&dir), Some(7979)).unwrap(), "file-key");
++        // The variable wins.
++        assert_eq!(lookup_key(Some(" env-key ".into()), Some(&dir), Some(7979)).unwrap(), "env-key");
++        assert_eq!(lookup_key(Some("env-key".into()), None, None).unwrap(), "env-key");
++        // Read again every time: the app writes a new key at every start.
++        std::fs::write(&path, "new-key").unwrap();
++        assert_eq!(lookup_key(None, Some(&dir), Some(7979)).unwrap(), "new-key");
++        // Another port, another file.
++        assert!(lookup_key(None, Some(&dir), Some(7980)).is_err());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn key_only_for_loopback_addresses() {
++        let peer = |s: &str| s.parse::<SocketAddr>().ok();
++        for (addr, at) in [
++            ("127.0.0.1:7979", "127.0.0.1:7979"),
++            ("127.0.0.2:7979", "127.0.0.2:7979"),
++            ("[::1]:7979", "[::1]:7979"),
++            ("[::ffff:127.0.0.1]:7979", "[::ffff:127.0.0.1]:7979"),
++            ("localhost:7979", "127.0.0.1:7979"),
++            ("localhost:7979", "[::1]:7979"),
++            ("LocalHost:7979", "127.0.0.1:7979"),
++        ] {
++            assert!(may_send_key(addr, peer(at)), "{addr} at {at}");
++        }
++        for (addr, at) in [
++            ("192.0.2.20:7979", "192.0.2.20:7979"),
++            ("10.0.0.7:7979", "10.0.0.7:7979"),
++            ("[fe80::1]:7979", "[fe80::1]:7979"),
++            ("0.0.0.0:7979", "127.0.0.1:7979"),
++            // Host names other than localhost: even when they lead to this machine.
++            ("workstation:7979", "127.0.1.1:7979"),
++            ("example.org:7979", "93.184.215.14:7979"),
++            ("localhost.example.org:7979", "127.0.0.1:7979"),
++            // `localhost` that does not lead to a loopback address.
++            ("localhost:7979", "192.0.2.20:7979"),
++        ] {
++            assert!(!may_send_key(addr, peer(at)), "{addr} at {at}");
++        }
++        // No peer address: no key.
++        assert!(!may_send_key("127.0.0.1:7979", None));
++    }
++
++    /// A stand-in for the app on 127.0.0.1: every request line goes to the returned channel and
++    /// gets `answer(request)`: a reply and whether to close the connection after it, or `None`
++    /// to close it without a reply (the app quit).
++    fn fake_app(answer: impl Fn(&Value) -> Option<(Value, bool)> + Send + Sync + 'static) -> (u16, Receiver<Value>) {
++        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let (tx, rx) = channel();
++        let answer = Arc::new(answer);
++        std::thread::spawn(move || {
++            for stream in listener.incoming().flatten() {
++                let (tx, answer) = (tx.clone(), answer.clone());
++                std::thread::spawn(move || {
++                    let mut out = stream.try_clone().unwrap();
++                    for line in BufReader::new(stream).lines() {
++                        let Ok(req) = serde_json::from_str::<Value>(&line.unwrap_or_default()) else { return };
++                        let _ = tx.send(req.clone());
++                        let Some((mut reply, close)) = answer(&req) else { return };
++                        reply["id"] = req["id"].clone();
++                        if writeln!(out, "{reply}").is_err() || close {
++                            return;
++                        }
++                    }
++                });
++            }
++        });
++        (port, rx)
++    }
++
++    fn fixed_key(key: &'static str) -> KeyFinder {
++        Box::new(move |_| Ok(key.to_string()))
++    }
++
++    const WAIT: Duration = Duration::from_secs(5);
++
++    #[test]
++    fn sends_the_key_to_loopback() {
++        let (port, seen) = fake_app(|_| Some((json!({"ok": true, "result": 7}), false)));
++        for host in ["127.0.0.1", "localhost"] {
++            let mut r = Remote::connect_with(&format!("{host}:{port}"), fixed_key("k1")).unwrap();
++            assert!(r.key_warning().is_none(), "{host}");
++            assert_eq!(r.call("document.inspect", json!({})).unwrap(), json!(7));
++            assert_eq!(seen.recv_timeout(WAIT).unwrap()["key"], "k1", "{host}");
++        }
++    }
++
++    #[test]
++    fn reads_the_key_again_on_a_new_connection() {
++        // The app restarted with a new key: the old key is refused (and the connection closed).
++        let (port, seen) = fake_app(|req| {
++            Some(if req["key"] == "new" { (json!({"ok": true, "result": 1}), false) } else { (json!({"ok": false, "error": "unauthorized"}), true) })
++        });
++        let reads = Arc::new(AtomicUsize::new(0));
++        let n = reads.clone();
++        let finder: KeyFinder = Box::new(move |_| Ok(if n.fetch_add(1, Ordering::SeqCst) == 0 { "old" } else { "new" }.to_string()));
++        let mut r = Remote::connect_with(&format!("127.0.0.1:{port}"), finder).unwrap();
++        assert_eq!(r.call("document.inspect", json!({})).unwrap(), json!(1));
++        assert_eq!(seen.recv_timeout(WAIT).unwrap()["key"], "old");
++        assert_eq!(seen.recv_timeout(WAIT).unwrap()["key"], "new");
++        assert_eq!(reads.load(Ordering::SeqCst), 2);
++        // The new key is kept for the next requests on the same connection.
++        assert_eq!(r.call("document.inspect", json!({})).unwrap(), json!(1));
++        assert_eq!(reads.load(Ordering::SeqCst), 2);
++
++        // The app quits mid-session (connection closed): the retry reads the key again.
++        let (port, seen) = fake_app(|req| if req["id"] == 2 { None } else { Some((json!({"ok": true, "result": 1}), false)) });
++        let reads = Arc::new(AtomicUsize::new(0));
++        let n = reads.clone();
++        let finder: KeyFinder = Box::new(move |_| Ok(format!("key-{}", n.fetch_add(1, Ordering::SeqCst))));
++        let mut r = Remote::connect_with(&format!("127.0.0.1:{port}"), finder).unwrap();
++        r.call("document.inspect", json!({})).unwrap();
++        r.call("document.inspect", json!({})).unwrap_err();
++        let keys: Vec<Value> = seen.try_iter().map(|v| v["key"].clone()).collect();
++        assert_eq!(keys.first(), Some(&json!("key-0")), "{keys:?}");
++        assert_eq!(keys.last(), Some(&json!("key-1")), "{keys:?}");
++    }
++
++    #[test]
++    fn no_key_for_other_hosts_and_a_clear_error() {
++        // There is no LAN address to test with here: same stand-in, with the decision a LAN
++        // address gets.
++        let (port, seen) = fake_app(|req| {
++            Some(if req.get("key").is_some() {
++                (json!({"ok": true, "result": 1}), false)
++            } else {
++                (json!({"ok": false, "error": "unauthorized"}), true)
++            })
++        });
++        let finder: KeyFinder = Box::new(|_| Err("the key must not be read for another host".to_string()));
++        let mut r = Remote::connect_with(&format!("127.0.0.1:{port}"), finder).unwrap();
++        r.send_key = false;
++        assert!(r.key_warning().is_some_and(|w| w.contains("not a loopback address")));
++        let e = r.call("document.inspect", json!({})).unwrap_err();
++        assert!(e.contains("not a loopback address") && e.contains("not sent"), "{e}");
++        assert!(seen.recv_timeout(WAIT).unwrap().get("key").is_none());
++    }
++}
+diff --git a/docs/control-protocol.md b/docs/control-protocol.md
+index 07741fd..2df2012 100644
+--- a/docs/control-protocol.md
++++ b/docs/control-protocol.md
+@@ -1,13 +1,52 @@
+ # Control protocol
+ 
+-Start the app with `--control <port>`. The server listens on `127.0.0.1` only and speaks JSON
+-lines: one request object per line, one reply per line.
++Start the app with `--control <port>` (or `DECKCRAFT_CONTROL_PORT=<port>`). The server listens on
++`127.0.0.1` only and speaks JSON lines: one request object per line, with the window's key (see
++[Keys](#keys)), one reply per line.
+ 
+ ```json
+-{"id": 1, "method": "engine.execute", "params": {"command": "shape.insert", "params": {"preset": "roundRect", "rect": [100, 100, 240, 120], "text": "Hello"}}}
++{"id": 1, "key": "…", "method": "engine.execute", "params": {"command": "shape.insert", "params": {"preset": "roundRect", "rect": [100, 100, 240, 120], "text": "Hello"}}}
+ {"id": 1, "ok": true, "result": {"id": 258}}
+ ```
+ 
++A line that isn't valid JSON gets one error reply, then the server closes the connection (so an
++HTTP request sent to the port can't run a command); reconnect to continue.
++
++## Keys
++
++Any local program (and possibly a web page) can reach a loopback port, so every request needs the
++window's key. Once the port is bound, the app writes a random key (256 bits, as hex) to
++`<settings>/control-key.<instance>` and removes the file when the window closes; a new start
++writes a new key. `<settings>` is the folder that holds the preferences: on Linux
++`$XDG_CONFIG_HOME/deckcraft` (by default `~/.config/deckcraft`), on macOS
++`~/Library/Application Support/DeckCraft`, on Windows `%APPDATA%\DeckCraft`. `<instance>` is the
++Flatpak instance id inside Flatpak, and `local-<port>` otherwise. On Unix the file has mode 0600.
++
++```sh
++cat ~/.config/deckcraft/control-key.local-7979   # Linux, outside Flatpak, port 7979
++```
++
++- Send the key as top-level `"key"` with every request, or once per connection with
++  `{"method": "auth", "key": "…"}` (reply `{"ok": true, "result": {}}`); later requests on that
++  connection may leave `key` out. Only `auth` reads `params.key`; for other methods `params.key`
++  is an ordinary parameter (`ui.key {"key": "Enter"}` presses Enter).
++- The key is checked on every request. A missing or wrong key gets
++  `{"ok": false, "error": "unauthorized"}`, and the app closes the connection.
++- A line over 64 MiB gets `{"ok": false, "error": "line too long"}`, and the app closes the
++  connection.
++- A connection that sends no authorised request within 30 s of being accepted is closed. That is
++  one limit: blank lines and bad JSON do not extend it. After an authorised request the
++  connection may stay idle.
++
++`deckcraft-cli mcp --connect` and `deckcraft-cli app` take the key from `DECKCRAFT_CONTROL_KEY`,
++or else from the key file for the port they connect to, and read it again on every new
++connection (the app may have restarted). They send the key only to loopback addresses
++(`127.0.0.0/8`, `::1`, `localhost`). For any other host they send no key, say so, and the app
++refuses the requests: to drive an app on another machine, forward its port to `127.0.0.1` (for
++example `ssh -L 7979:127.0.0.1:7979 host`) and set `DECKCRAFT_CONTROL_KEY` to that app's key.
++
++## Methods
++
+ Coordinates are slide points (1/72 inch; a 16:9 slide is 960 × 540) unless noted.
+ 
+ | Method | Params | What it does |
+diff --git a/docs/mcp.md b/docs/mcp.md
+index f7e24c7..891c3f0 100644
+--- a/docs/mcp.md
++++ b/docs/mcp.md
+@@ -3,7 +3,9 @@
+ `deckcraft-cli mcp` runs a Model Context Protocol server on stdio. By default it drives its own
+ headless engine (no window); with `--connect PORT` it drives a running DeckCraft started with
+ `--control PORT`, so an agent and a person can work on the same deck. `--sample` opens the sample
+-deck.
++deck. With `--connect`, the bridge sends the app's control key, which it reads from
++`DECKCRAFT_CONTROL_KEY` or from the key file the app writes at start, and only to loopback
++addresses; see [Keys](control-protocol.md#keys).
+ 
+ ```json
+ {
+-- 
+2.52.0.windows.1
+

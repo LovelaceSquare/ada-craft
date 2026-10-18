@@ -1,0 +1,326 @@
+From f3ef3a72cf121813cd9db45b31e345ef974349c4 Mon Sep 17 00:00:00 2001
+From: Lovelace's Square <noreply@lovelacesquare.org>
+Date: Sun, 18 Oct 2026 09:53:49 +0200
+Subject: [PATCH 2/3] Let assistants connect: a setting that opens every
+ window's control channel
+
+A window opened from the file manager has no control port, so an
+assistant the user works with (an MCP client, say) cannot join the
+window the user is editing. File > Options > Agents gets "Let assistants
+connect to this window", off by default. When on, a window started
+without --control opens its control channel as `--control auto` does
+(a free port, the key file named after it); the key is still required
+on every request.
+
+- ui-egui: UiState::allow_assistants (allowAssistants in ui.json, off
+  when missing or junk), the `ui.allowAssistants` command (works without
+  a document, like the other settings), the checkbox and a note in
+  File > Options > Agents (not on the web, which has no control
+  channel), and WordApp::set_control for a channel opened while the app
+  runs.
+- wordcraft: the setting picks `auto` at start-up when no port was given;
+  changed while running, it is saved at once (so windows opened next
+  follow it) and turning it on opens this window's channel. Turning it
+  off leaves an open channel until the window closes. A channel opened
+  only for this keeps the Start screen.
+- docs: control-protocol.md lists ui.allowAssistants.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Esdp3ZTPsHBV41yHxMJHnJ
+---
+ apps/wordcraft/src/main.rs    | 50 +++++++++++++++++++++++++++-------
+ crates/ui-egui/src/lib.rs     | 51 ++++++++++++++++++++++++++++++++++-
+ crates/ui-egui/src/options.rs | 40 +++++++++++++++++++++++++--
+ docs/control-protocol.md      |  5 +++-
+ 4 files changed, 132 insertions(+), 14 deletions(-)
+
+diff --git a/apps/wordcraft/src/main.rs b/apps/wordcraft/src/main.rs
+index 62d8e35..8a509a4 100644
+--- a/apps/wordcraft/src/main.rs
++++ b/apps/wordcraft/src/main.rs
+@@ -30,22 +30,40 @@ use wordcraft_ui_egui::{
+ };
+ 
+ /// The app, the restored window geometry until the first frame has checked it, the control
+-/// server's key file (removed on exit), the file dialogs the app asked for and, on macOS, the
+-/// documents opened from Finder.
++/// server's key file (removed on exit), the file dialogs the app asked for, the control
++/// channel's state and, on macOS, the documents opened from Finder.
+ struct App(
+     WordApp,
+     Option<WindowGeometry>,
+     Option<control_server::KeyFile>,
+     file_dialogs::Launcher,
++    Control,
+     #[cfg(target_os = "macos")] fmv_macos_events::Inbox,
+ );
+ 
++/// Whether the window's control channel is open, and File › Options › Agents › Let assistants
++/// connect as of the last frame.
++struct Control {
++    open: bool,
++    allow_assistants: bool,
++}
++
+ impl eframe::App for App {
+     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+         #[cfg(target_os = "macos")]
+-        apple_events::poll(&self.4, &mut self.0, ctx);
++        apple_events::poll(&self.5, &mut self.0, ctx);
+         self.0.logic(ctx);
+         self.3.show(frame);
++        // Let assistants connect, changed in File › Options or by `ui.allowAssistants`: saved at
++        // once, so windows opened from now on follow it, and turned on, it opens this window's
++        // control channel on a free port. Turned off, an open channel stays until the window closes.
++        if self.0.ui.allow_assistants != self.4.allow_assistants {
++            self.4.allow_assistants = self.0.ui.allow_assistants;
++            save_prefs(&self.0);
++            if self.4.allow_assistants && !self.4.open {
++                self.4.open = open_control(&mut self.0, control_server::AUTO, ctx, &mut self.2);
++            }
++        }
+         let prev = self.0.ui.window;
+         self.0.ui.window = ctx.input(|i| WindowGeometry::track(prev, i.viewport(), i.viewport_rect().size()));
+         if let Some(pos) = ctx.input(|i| take_rescue(&mut self.1, i.viewport())) {
+@@ -121,6 +139,15 @@ fn schedule_macos_terminate(app: &WordApp, key_file: Option<&control_server::Key
+     });
+ }
+ 
++/// Start the control server on `port` ([`control_server::AUTO`]: a free one) and hand its
++/// requests to the app; its key file goes in `key_file`. Whether it started.
++fn open_control(app: &mut WordApp, port: u16, ctx: &egui::Context, key_file: &mut Option<control_server::KeyFile>) -> bool {
++    let Some((rx, file)) = control_server::start(port, ctx.clone(), wordcraft_control_key::settings_dir().as_deref()) else { return false };
++    app.set_control(rx);
++    *key_file = file;
++    true
++}
++
+ /// `ui.json` in the settings folder, which the MCP bridge also uses to find the control key.
+ fn prefs_path() -> Option<std::path::PathBuf> {
+     wordcraft_control_key::settings_dir().map(|b| b.join("ui.json"))
+@@ -332,15 +359,17 @@ fn main() -> eframe::Result {
+             app.ui.window = restored;
+             app.integrated_titlebar = cfg!(target_os = "macos");
+             let mut key_file = None;
+-            if let Some(port) = control_port
+-                && let Some((rx, file)) = control_server::start(port, cc.egui_ctx.clone(), wordcraft_control_key::settings_dir().as_deref())
+-            {
+-                app = app.with_control(rx);
+-                key_file = file;
+-            }
++            // With Let assistants connect on (File › Options › Agents), a window started without
++            // a control port opens one anyway, on a free port: `--control auto`.
++            let port = control_port.or_else(|| app.ui.allow_assistants.then_some(control_server::AUTO));
++            let control = Control {
++                open: port.is_some_and(|port| open_control(&mut app, port, &cc.egui_ctx, &mut key_file)),
++                allow_assistants: app.ui.allow_assistants,
++            };
+             // Nothing to open (no files, no sample, no control channel driving the editor): start
+             // on File › Home, as Word does (#766), unless the Start screen option is off. Files
+-            // macOS hands over later open on top of it and close it (`apple_events`).
++            // macOS hands over later open on top of it and close it (`apple_events`). A channel
++            // opened only because assistants may connect keeps the Start screen.
+             if files.is_empty() && !sample && control_port.is_none() {
+                 app.start_screen();
+             }
+@@ -354,6 +383,7 @@ fn main() -> eframe::Result {
+                 restored,
+                 key_file,
+                 dialogs,
++                control,
+                 #[cfg(target_os = "macos")]
+                 apple_events.connect(&cc.egui_ctx),
+             )))
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index af0385e..f8012d2 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -257,6 +257,11 @@ pub struct UiState {
+     /// File › Options › General: start on File › Home (Blank document, templates, Recent) when
+     /// the app opens without a document (#766); on, as in Word. See [`WordApp::start_screen`].
+     pub start_screen: bool,
++    /// File › Options › Agents: let assistants connect. Desktop: a window started without
++    /// `--control` opens its control channel anyway, on a free port (`--control auto`), so a
++    /// local program that can read the window's key file (an MCP client, say) can edit the
++    /// document alongside the user. Off by default.
++    pub allow_assistants: bool,
+     /// File › Options › Display: print the page colour (off, as in Word).
+     pub print_backgrounds: bool,
+     /// File › Options › Display: update fields (dates, page numbers, SEQ…) before printing.
+@@ -310,6 +315,7 @@ impl Default for UiState {
+             recent_count: 12,
+             mini_toolbar: true,
+             start_screen: true,
++            allow_assistants: false,
+             print_backgrounds: false,
+             update_fields_before_print: false,
+             dictionary: Vec::new(),
+@@ -548,10 +554,16 @@ impl WordApp {
+     }
+ 
+     pub fn with_control(mut self, rx: std::sync::mpsc::Receiver<ControlRequest>) -> Self {
+-        self.control_rx = Some(rx);
++        self.set_control(rx);
+         self
+     }
+ 
++    /// Take control requests from `rx` from now on: a control channel opened while the app runs
++    /// (File › Options › Agents › Let assistants connect).
++    pub fn set_control(&mut self, rx: std::sync::mpsc::Receiver<ControlRequest>) {
++        self.control_rx = Some(rx);
++    }
++
+     /// Start-up with no document to open (#766): show File › Home (Blank document, the templates
+     /// and Recent), as Word starts, when the Start screen setting is on (the default). No document
+     /// is open until the user picks Blank document or a template or opens a file (#1129): Esc or
+@@ -1195,6 +1207,17 @@ impl WordApp {
+                 }
+                 json!({"startScreen": self.ui.start_screen})
+             }
++            "ui.allowAssistants" => {
++                // File › Options › Agents: `value` true or false lets assistants connect to the
++                // desktop app's windows (each opens its control channel on a free port) or not;
++                // no value reads it.
++                match p.get("value") {
++                    None => {}
++                    Some(Value::Bool(on)) => self.ui.allow_assistants = *on,
++                    Some(_) => return Some(Err("`value` must be true or false".into())),
++                }
++                json!({"allowAssistants": self.ui.allow_assistants})
++            }
+             // Shape Format › Text › Create Link: the next click on an empty text box links the
+             // selected box to it (`shape.link` with that box as the target); Esc cancels.
+             "ui.linkTextBox" => {
+@@ -1911,6 +1934,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
+             | "ui.discord"
+             | "ui.caretAnimation"
+             | "ui.startScreen"
++            | "ui.allowAssistants"
+     ) || id.starts_with("help.")
+ }
+ 
+@@ -2055,6 +2079,31 @@ mod tests {
+         assert_eq!(a.run("ui.caretAnimation", json!({"value": true})).unwrap()["caretAnimation"], true);
+     }
+ 
++    /// File › Options › Agents: letting assistants connect is a UI command, kept between runs,
++    /// and off unless the user turned it on.
++    #[test]
++    fn allow_assistants_is_a_ui_command_and_survives_a_restart() {
++        let mut a = app();
++        assert_eq!(a.run("ui.allowAssistants", json!({})).unwrap(), json!({"allowAssistants": false}), "off by default; no value reads it");
++        assert_eq!(a.run("ui.allowAssistants", json!({"value": true})).unwrap(), json!({"allowAssistants": true}));
++        for junk in [json!({"value": "yes"}), json!({"value": 0}), json!({"value": null}), json!({"value": [false]})] {
++            assert!(a.run("ui.allowAssistants", junk).is_err());
++        }
++        assert!(a.ui.allow_assistants, "a rejected value keeps the setting");
++        let saved = serde_json::to_string(&a.prefs()).unwrap();
++        assert!(saved.contains(r#""allowAssistants":true"#), "{saved}");
++        let mut b = app();
++        b.apply_prefs(UiState::from_json(saved.as_bytes()).unwrap());
++        assert!(b.ui.allow_assistants);
++        // Settings saved before the option existed, or holding junk for it, leave it off.
++        for old in [r#"{"tab":"Insert"}"#, r#"{"tab":"Insert","allowAssistants":"yes"}"#] {
++            let old = UiState::from_json(old.as_bytes()).unwrap();
++            assert!(!old.allow_assistants && old.tab == "Insert");
++        }
++        // It works with no document open, like the other settings.
++        assert!(works_without_document("ui.allowAssistants"));
++    }
++
+     fn harness(a: WordApp) -> egui_kittest::Harness<'static, WordApp> {
+         egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+             |ui, app: &mut WordApp| {
+diff --git a/crates/ui-egui/src/options.rs b/crates/ui-egui/src/options.rs
+index da75c87..7c9032e 100644
+--- a/crates/ui-egui/src/options.rs
++++ b/crates/ui-egui/src/options.rs
+@@ -135,7 +135,7 @@ pub fn page(app: &mut WordApp, ui: &mut Ui) {
+                 "language" => language(app, ui),
+                 "accessibility" => accessibility(app, ui),
+                 "advanced" => advanced(app, ui),
+-                "agents" => agents(ui),
++                "agents" => agents(app, ui),
+                 _ => general(app, ui),
+             }
+         });
+@@ -448,9 +448,22 @@ fn advanced(app: &mut WordApp, ui: &mut Ui) {
+     });
+ }
+ 
+-fn agents(ui: &mut Ui) {
++fn agents(app: &mut WordApp, ui: &mut Ui) {
+     section(ui, "Agents");
+     ui.label(tl!("Every command is available to scripts and AI agents: run `wordcraft-cli mcp` for an MCP server, or start the app with `--control <port>` for the JSON control channel."));
++    // The web app has no control channel to open.
++    if cfg!(target_arch = "wasm32") {
++        return;
++    }
++    ui.add_space(8.0);
++    let mut allow = app.ui.allow_assistants;
++    if ui.checkbox(&mut allow, tl!("Let assistants connect to this window")).changed() {
++        let _ = app.run("ui.allowAssistants", json!({"value": allow}));
++    }
++    note(
++        ui,
++        "When on, WordCraft windows accept AI assistants running on this computer (such as an MCP client), so they can read and edit the document with you. Takes effect in this window now and in windows opened later.",
++    );
+ }
+ 
+ /// Interface theme: Light, Dark, or follow the system's appearance (#115).
+@@ -814,6 +827,29 @@ mod tests {
+         assert!(h.state().ui.start_screen, "and on again");
+     }
+ 
++    /// File › Options › Agents: the checkbox is the `ui.allowAssistants` setting, off at first.
++    #[test]
++    fn agents_checkbox_lets_assistants_connect() {
++        let mut a = app();
++        a.run("file.options", json!({"pane": "agents"})).unwrap();
++        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
++            |ui, app: &mut WordApp| {
++                let ctx = ui.ctx().clone();
++                app.logic(&ctx);
++                app.ui(ui);
++            },
++            a,
++        );
++        h.run_steps(4);
++        assert!(!h.state().ui.allow_assistants, "off at first");
++        h.get_by_label("Let assistants connect to this window").click();
++        h.run_steps(4);
++        assert!(h.state().ui.allow_assistants, "the checkbox turns it on");
++        h.get_by_label("Let assistants connect to this window").click();
++        h.run_steps(4);
++        assert!(!h.state().ui.allow_assistants, "and off again");
++    }
++
+     /// File › Options › Advanced › Animation: the checkbox is the `ui.caretAnimation` setting,
+     /// and the section is translated.
+     #[test]
+diff --git a/docs/control-protocol.md b/docs/control-protocol.md
+index 463c52e..41674e9 100644
+--- a/docs/control-protocol.md
++++ b/docs/control-protocol.md
+@@ -26,6 +26,9 @@ writes a new key. `<settings>` is the folder that holds the preferences: on Linu
+ Flatpak instance id inside Flatpak, and `local-<port>` otherwise, with the port the window is
+ listening on (also with `auto`). On Unix the file has mode 0600.
+ 
++A window started without `--control` has no control channel, unless File › Options › Agents ›
++Let assistants connect (`ui.allowAssistants`) is on: then it opens one as `--control auto` does.
++
+ ```sh
+ cat ~/.config/wordcraft/control-key.local-7981   # Linux, outside Flatpak, port 7981
+ ```
+@@ -53,7 +56,7 @@ and set `WORDCRAFT_CONTROL_KEY` to that app's key.
+ 
+ | Method | Params | Result |
+ |---|---|---|
+-| `engine.execute` | `command`, `params` | the command's result (any id from `engine.commands`, including UI commands `ui.tab`, `ui.dialog`, `ui.backstage`, `ui.zotero.*` (see `docs/zotero.md`), `ui.language` (`{"value": "auto"|"en"|"zh-hans"|"zh-hant"|"ja"|"pt-br"|"es"|"uk"|"sr"|"sr-latn"|"et"|"tr"|"ru"|"pl"|"de"|"it"|"cs"|"hu"|"fr"}`), `ui.theme` (`{"value": "system"|"light"|"dark"}`; `system` follows the OS appearance, light when it reports none), `ui.interfaceSize` (`{"value": "auto"}` or `{"percent": 50–300}`, clamped; no value reads it; `auto` keeps the system display scale, a percentage is absolute, so 100 is one screen pixel per point (#822); the result's `percent` is the size drawn at and `auto` whether it follows the system; document zoom stays `view.zoom`), `ui.animations` (`{"value": "system"|"on"|"off"}`; no value reads it; `system` follows the system's animation setting, which the desktop app reads on Windows, macOS, Linux and the BSDs and the web app from `prefers-reduced-motion`, and means on where the system doesn't say; the result's `enabled` is what the setting comes to and `system` what the system reports, `null` when it doesn't say), `ui.fileBrowser` (desktop: `{"purpose": "document"|"picture"|"recipients"|"save"}` opens WordCraft's own file browser, for when the system file dialog doesn't show up, #576), `ui.caretAnimation` (`{"value": true|false}`; no value reads it; off, the caret jumps and blinks on and off instead of gliding and fading), `ui.startScreen` (`{"value": true|false}`; no value reads it; on, the default, the desktop and web apps start on File › Home when launched with nothing to open, #766)…) |
++| `engine.execute` | `command`, `params` | the command's result (any id from `engine.commands`, including UI commands `ui.tab`, `ui.dialog`, `ui.backstage`, `ui.zotero.*` (see `docs/zotero.md`), `ui.language` (`{"value": "auto"|"en"|"zh-hans"|"zh-hant"|"ja"|"pt-br"|"es"|"uk"|"sr"|"sr-latn"|"et"|"tr"|"ru"|"pl"|"de"|"it"|"cs"|"hu"|"fr"}`), `ui.theme` (`{"value": "system"|"light"|"dark"}`; `system` follows the OS appearance, light when it reports none), `ui.interfaceSize` (`{"value": "auto"}` or `{"percent": 50–300}`, clamped; no value reads it; `auto` keeps the system display scale, a percentage is absolute, so 100 is one screen pixel per point (#822); the result's `percent` is the size drawn at and `auto` whether it follows the system; document zoom stays `view.zoom`), `ui.animations` (`{"value": "system"|"on"|"off"}`; no value reads it; `system` follows the system's animation setting, which the desktop app reads on Windows, macOS, Linux and the BSDs and the web app from `prefers-reduced-motion`, and means on where the system doesn't say; the result's `enabled` is what the setting comes to and `system` what the system reports, `null` when it doesn't say), `ui.fileBrowser` (desktop: `{"purpose": "document"|"picture"|"recipients"|"save"}` opens WordCraft's own file browser, for when the system file dialog doesn't show up, #576), `ui.caretAnimation` (`{"value": true|false}`; no value reads it; off, the caret jumps and blinks on and off instead of gliding and fading), `ui.startScreen` (`{"value": true|false}`; no value reads it; on, the default, the desktop and web apps start on File › Home when launched with nothing to open, #766), `ui.allowAssistants` (`{"value": true|false}`; no value reads it; off by default; on, File › Options › Agents › Let assistants connect: every desktop window started without `--control` opens its control channel as `--control auto` does, and turning it on also opens the current window's; saved at once)…) |
+ | `engine.execute` | `command`, `params` | the command's result (any id from `engine.commands`, including UI commands `ui.tab`, `ui.dialog`, `ui.backstage`, `ui.zotero.*` (see `docs/zotero.md`), `ui.language` (`{"value": "auto"|"en"|"zh-hans"|"zh-hant"|"ja"|"pt-br"|"es"|"uk"|"sr"|"sr-latn"|"et"|"tr"|"ru"}`), `ui.theme` (`{"value": "system"|"light"|"dark"}`; `system` follows the OS appearance, light when it reports none), `ui.interfaceSize` (`{"value": "auto"}` or `{"percent": 50–300}`, clamped; no value reads it; `auto` keeps the system display scale, a percentage is absolute, so 100 is one screen pixel per point (#822); the result's `percent` is the size drawn at and `auto` whether it follows the system; document zoom stays `view.zoom`), `ui.animations` (`{"value": "system"|"on"|"off"}`; no value reads it; `system` follows the system's animation setting, which the desktop app reads on Windows, macOS, Linux and the BSDs and the web app from `prefers-reduced-motion`, and means on where the system doesn't say; the result's `enabled` is what the setting comes to and `system` what the system reports, `null` when it doesn't say), `ui.fileBrowser` (desktop: `{"purpose": "document"|"picture"|"recipients"|"save"}` opens WordCraft's own file browser, for when the system file dialog doesn't show up, #576), `ui.caretAnimation` (`{"value": true|false}`; no value reads it; off, the caret jumps and blinks on and off instead of gliding and fading), `ui.contextMenu` (opens the page's context menu below the caret, as Shift+F10 does)…) |
+ | `engine.commands` | — | every command: id, label, location, shortcut, params, enabled |
+ | `document.inspect` | `text?` | blocks (text, style, runs, lists, tables), parts, sections, selection, pages |
+-- 
+2.52.0.windows.1
+

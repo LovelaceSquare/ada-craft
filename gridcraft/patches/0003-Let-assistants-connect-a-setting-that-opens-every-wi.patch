@@ -1,0 +1,328 @@
+From 4b49b5867fdd033a24cea0391be8e20fd2351547 Mon Sep 17 00:00:00 2001
+From: Lovelace's Square <noreply@lovelacesquare.org>
+Date: Sun, 18 Oct 2026 10:41:07 +0200
+Subject: [PATCH 3/5] Let assistants connect: a setting that opens every
+ window's control channel
+
+A window opened from the file manager has no control port, so an
+assistant the user works with (an MCP client, say) cannot join the
+window the user is working in. File > Options gets an Agents section with
+"Let assistants connect to this window", off by default. When on, a
+window started without --control opens its control channel as
+`--control auto` does (a free port, the key file named after it); the
+key is still required on every request.
+
+- ui-egui: UiState::allow_assistants (allowAssistants in ui.json; off
+  when missing or not `true`, without failing the other settings), the
+  `ui.allowAssistants` command (`on`, alias `value`; without it the
+  setting is read, never toggled, since it decides who may drive the
+  app), listed in engine.commands, and the checkbox with a note in the
+  Backstage options (not on the web, which has no control channel).
+- gridcraft: the setting picks `auto` at start-up when no port was given;
+  changed while running, it is saved at once (so windows opened next
+  follow it) and turning it on opens this window's channel. Turning it
+  off leaves an open channel until the window closes.
+- docs: control-protocol.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Esdp3ZTPsHBV41yHxMJHnJ
+---
+ apps/gridcraft/src/main.rs         | 53 +++++++++++++++++++------
+ crates/ui-egui/src/backstage.rs    | 15 ++++++++
+ crates/ui-egui/src/control.rs      |  5 +++
+ crates/ui-egui/src/lib.rs          | 24 ++++++++++++
+ crates/ui-egui/tests/assistants.rs | 62 ++++++++++++++++++++++++++++++
+ docs/control-protocol.md           |  6 +++
+ 6 files changed, 153 insertions(+), 12 deletions(-)
+ create mode 100644 crates/ui-egui/tests/assistants.rs
+
+diff --git a/apps/gridcraft/src/main.rs b/apps/gridcraft/src/main.rs
+index f8de165..2ced72a 100644
+--- a/apps/gridcraft/src/main.rs
++++ b/apps/gridcraft/src/main.rs
+@@ -27,28 +27,46 @@ use gridcraft_engine::Session;
+ use gridcraft_ui_egui::{Services, SheetApp};
+ use serde_json::json;
+ 
+-/// The app, the control server's key file (removed on exit) and, on macOS, the native menu and
+-/// the documents opened from Finder.
++/// The app, the control server's key file (removed on exit), the control channel's state and, on
++/// macOS, the native menu and the documents opened from Finder.
+ struct App(
+     SheetApp,
+     Option<control_server::KeyFile>,
++    Control,
+     #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>,
+     #[cfg(target_os = "macos")] fmv_macos_events::Inbox,
+ );
+ 
++/// Whether the window's control channel is open, and File ▸ Options ▸ Agents ▸ Let assistants
++/// connect as of the last frame.
++struct Control {
++    open: bool,
++    allow_assistants: bool,
++}
++
+ impl eframe::App for App {
+     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+         #[cfg(target_os = "macos")]
+         {
+-            if self.2.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
+-                self.2 = Some(native_menu::NativeMenu::install(ctx));
++            if self.3.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
++                self.3 = Some(native_menu::NativeMenu::install(ctx));
+             }
+-            if let Some(m) = &self.2 {
++            if let Some(m) = &self.3 {
+                 m.poll(&mut self.0, ctx);
+             }
+-            apple_events::poll(&self.3, &mut self.0, ctx);
++            apple_events::poll(&self.4, &mut self.0, ctx);
+         }
+         self.0.logic(ctx);
++        // Let assistants connect, changed in File ▸ Options or by `ui.allowAssistants`: saved at
++        // once, so windows opened from now on follow it, and turned on, it opens this window's
++        // control channel on a free port. Turned off, an open channel stays until the window closes.
++        if self.0.ui.allow_assistants != self.2.allow_assistants {
++            self.2.allow_assistants = self.0.ui.allow_assistants;
++            save_prefs(&self.0);
++            if self.2.allow_assistants && !self.2.open {
++                self.2.open = open_control(&mut self.0, control_server::AUTO, ctx, &mut self.1);
++            }
++        }
+         self.0.poll_printing(ctx);
+         if ctx.input(|input| input.viewport().close_requested()) && self.0.printing.busy() {
+             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+@@ -85,6 +103,15 @@ impl eframe::App for App {
+     }
+ }
+ 
++/// Start the control server on `port` ([`control_server::AUTO`]: a free one) and hand its
++/// requests to the app; its key file goes in `key_file`. Whether it started.
++fn open_control(app: &mut SheetApp, port: u16, ctx: &egui::Context, key_file: &mut Option<control_server::KeyFile>) -> bool {
++    let Some((rx, file)) = control_server::start(port, ctx.clone(), config_dir().as_deref()) else { return false };
++    app.control_rx = Some(rx);
++    *key_file = file;
++    true
++}
++
+ /// The settings folder (`ui.json`, `prefs.json`, logs), which also holds the control key files
+ /// the MCP bridge reads.
+ fn config_dir() -> Option<std::path::PathBuf> {
+@@ -357,15 +384,17 @@ fn main() -> eframe::Result<()> {
+                 };
+                 SheetApp::setup_context_for_language(&cc.egui_ctx, app.ui.dark, app.ui.language);
+                 let mut key_file = None;
+-                if let Some(port) = control_port
+-                    && let Some((rx, file)) = control_server::start(port, cc.egui_ctx.clone(), config_dir().as_deref())
+-                {
+-                    app.control_rx = Some(rx);
+-                    key_file = file;
+-                }
++                // With Let assistants connect on (File ▸ Options ▸ Agents), a window started
++                // without a control port opens one anyway, on a free port: `--control auto`.
++                let port = control_port.or_else(|| app.ui.allow_assistants.then_some(control_server::AUTO));
++                let control = Control {
++                    open: port.is_some_and(|port| open_control(&mut app, port, &cc.egui_ctx, &mut key_file)),
++                    allow_assistants: app.ui.allow_assistants,
++                };
+                 Ok(Box::new(App(
+                     app,
+                     key_file,
++                    control,
+                     #[cfg(target_os = "macos")]
+                     None,
+                     #[cfg(target_os = "macos")]
+diff --git a/crates/ui-egui/src/backstage.rs b/crates/ui-egui/src/backstage.rs
+index 922baab..5be9f5b 100644
+--- a/crates/ui-egui/src/backstage.rs
++++ b/crates/ui-egui/src/backstage.rs
+@@ -973,6 +973,21 @@ fn options(app: &mut SheetApp, ui: &mut Ui) {
+     if ui.checkbox(&mut autosave, lang.tr("Save .xlsx workbooks automatically after every change")).changed() {
+         app.grid.toggle_autosave();
+     }
++    // The web app has no control channel to open.
++    if !cfg!(target_arch = "wasm32") {
++        ui.add_space(18.0);
++        section(ui, lang, "Options|Agents");
++        let mut allow = app.ui.allow_assistants;
++        if ui.checkbox(&mut allow, lang.tr("Let assistants connect to this window")).changed() {
++            app.run_or_alert("ui.allowAssistants", json!({"on": allow}));
++        }
++        dim(
++            ui,
++            lang.tr(
++                "When on, GridCraft windows accept AI assistants running on this computer (such as an MCP client), so they can read and edit the workbook with you. Takes effect in this window now and in windows opened later.",
++            ),
++        );
++    }
+     let Some(calc) = app.session.active().map(|d| d.wb.calc.clone()) else { return };
+     ui.add_space(18.0);
+     section(ui, lang, "Formulas");
+diff --git a/crates/ui-egui/src/control.rs b/crates/ui-egui/src/control.rs
+index 2ea5cfa..d043b6f 100644
+--- a/crates/ui-egui/src/control.rs
++++ b/crates/ui-egui/src/control.rs
+@@ -182,6 +182,11 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
+                 ("view.theme", "Display Theme", ""),
+                 ("view.animations", "Animations", "{on?: bool} (toggles without it) → {on}"),
+                 ("options.autoComplete", "Enable AutoComplete for cell values", "{on?: bool} (toggles without it) → {on}"),
++                (
++                    "ui.allowAssistants",
++                    "Let assistants connect to this window",
++                    "{on?: bool} (reads without it; `value` is an alias) → {on}; desktop windows started without --control open the control channel as --control auto does",
++                ),
+                 ("view.interfaceScale", "Interface Size", "{percent: 75–200 | \"auto\"} (100 = auto; clamped)"),
+                 ("ui.dialog", "Open Dialog", ""),
+                 ("ui.backstage", "File (Backstage view)", "{page?: home|new|open|info|saveAs|print|export|options|close}"),
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index f96cdac..9babede 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -76,6 +76,12 @@ pub struct UiState {
+     /// [`INTERFACE_SCALE_MIN`]..=[`INTERFACE_SCALE_MAX`]; a malformed saved value reads as 100.
+     #[serde(deserialize_with = "lenient_interface_scale")]
+     pub interface_scale: u16,
++    /// File ▸ Options ▸ Agents: let assistants connect. Desktop: a window started without
++    /// `--control` opens its control channel anyway, on a free port (`--control auto`), so a local
++    /// program that can read the window's key file (an MCP client, say) can work on the workbook
++    /// alongside the user. Off by default; anything but `true` in `ui.json` reads as off.
++    #[serde(deserialize_with = "lenient_off")]
++    pub allow_assistants: bool,
+ }
+ 
+ pub const INTERFACE_SCALE_MIN: u16 = 75;
+@@ -92,6 +98,12 @@ fn lenient_interface_scale<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u16
+     Ok(v.as_f64().and_then(clamp_interface_scale).unwrap_or(100))
+ }
+ 
++/// A switch that is on only when saved as `true`: a malformed value reads as off rather than
++/// failing the whole `UiState`.
++fn lenient_off<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
++    Ok(Json::deserialize(d)?.as_bool().unwrap_or(false))
++}
++
+ impl Default for UiState {
+     fn default() -> Self {
+         UiState {
+@@ -107,6 +119,7 @@ impl Default for UiState {
+             keytip_invoke: None,
+             language: i18n::Language::En,
+             interface_scale: 100,
++            allow_assistants: false,
+         }
+     }
+ }
+@@ -608,6 +621,17 @@ impl SheetApp {
+                 self.ui.autocomplete = p.get("on").and_then(Json::as_bool).unwrap_or(!self.ui.autocomplete);
+                 Ok(json!({"on": self.ui.autocomplete}))
+             }
++            "ui.allowAssistants" => {
++                // File ▸ Options ▸ Agents: `on` (or `value`) true or false lets assistants connect to
++                // the desktop app's windows (each opens its control channel on a free port) or not.
++                // Without it the setting is read, never toggled: it decides who may drive the app.
++                match p.get("on").or_else(|| p.get("value")) {
++                    None => {}
++                    Some(Json::Bool(on)) => self.ui.allow_assistants = *on,
++                    Some(_) => return Some(Err("`on` must be true or false".into())),
++                }
++                Ok(json!({"on": self.ui.allow_assistants}))
++            }
+             "view.interfaceScale" => {
+                 // `{"percent": 125}` or `{"percent": "auto"}`; out-of-range values are clamped.
+                 let percent = match p.get("percent") {
+diff --git a/crates/ui-egui/tests/assistants.rs b/crates/ui-egui/tests/assistants.rs
+new file mode 100644
+index 0000000..4a88c99
+--- /dev/null
++++ b/crates/ui-egui/tests/assistants.rs
+@@ -0,0 +1,62 @@
++//! File ▸ Options ▸ Agents ▸ Let assistants connect: a setting kept in `ui.json`, off by
++//! default, read and set through `ui.allowAssistants`, and a checkbox in the Backstage options.
++#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
++
++use egui_kittest::kittest::Queryable;
++use gridcraft_engine::Session;
++use gridcraft_ui_egui::{SheetApp, UiState};
++use serde_json::json;
++
++fn app() -> SheetApp {
++    let mut session = Session::new();
++    session.new_workbook();
++    SheetApp::new(session, Default::default())
++}
++
++fn harness(app: SheetApp) -> egui_kittest::Harness<'static, SheetApp> {
++    egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_ui_state(
++        |ui, app: &mut SheetApp| {
++            app.logic(ui.ctx());
++            app.ui(ui);
++        },
++        app,
++    )
++}
++
++#[test]
++fn allow_assistants_is_a_ui_command_kept_in_ui_json_and_off_by_default() {
++    let mut a = app();
++    assert_eq!(a.run("ui.allowAssistants", json!({})), Ok(json!({"on": false})), "off by default; no value reads it");
++    assert_eq!(a.run("ui.allowAssistants", json!({})), Ok(json!({"on": false})), "reading never toggles it");
++    assert_eq!(a.run("ui.allowAssistants", json!({"on": true})), Ok(json!({"on": true})));
++    assert_eq!(a.run("ui.allowAssistants", json!({"value": false})), Ok(json!({"on": false})), "`value` is an alias");
++    a.run("ui.allowAssistants", json!({"on": true})).unwrap();
++    for junk in [json!({"on": "yes"}), json!({"on": 1}), json!({"on": null}), json!({"value": [true]})] {
++        assert!(a.run("ui.allowAssistants", junk.clone()).is_err(), "{junk}");
++    }
++    assert!(a.ui.allow_assistants, "a rejected value keeps the setting");
++    let saved = serde_json::to_string(&a.ui).unwrap();
++    assert!(saved.contains(r#""allowAssistants":true"#), "{saved}");
++    let back: UiState = serde_json::from_str(&saved).unwrap();
++    assert!(back.allow_assistants);
++    // Settings saved before the option existed, or holding junk for it, leave it off and keep the rest.
++    for old in [r#"{"dark": true}"#, r#"{"dark": true, "allowAssistants": "yes"}"#, r#"{"dark": true, "allowAssistants": null}"#] {
++        let ui: UiState = serde_json::from_str(old).unwrap();
++        assert!(!ui.allow_assistants && ui.dark, "{old}");
++    }
++}
++
++#[test]
++fn the_options_page_has_the_checkbox() {
++    let mut a = app();
++    a.run("ui.backstage", json!({"page": "options"})).unwrap();
++    let mut h = harness(a);
++    h.run_steps(4);
++    assert!(!h.state().ui.allow_assistants, "off at first");
++    h.get_by_label("Let assistants connect to this window").click();
++    h.run_steps(4);
++    assert!(h.state().ui.allow_assistants, "the checkbox turns it on");
++    h.get_by_label("Let assistants connect to this window").click();
++    h.run_steps(4);
++    assert!(!h.state().ui.allow_assistants, "and off again");
++}
+diff --git a/docs/control-protocol.md b/docs/control-protocol.md
+index f2b1e4c..9860066 100644
+--- a/docs/control-protocol.md
++++ b/docs/control-protocol.md
+@@ -33,6 +33,11 @@ writes a new key. `<settings>` is the folder that holds the preferences: on Linu
+ Flatpak instance id inside Flatpak, and `local-<port>` otherwise, with the port the window is
+ listening on (also with `auto`). On Unix the file has mode 0600.
+ 
++A window started without `--control` has no control channel, unless File ▸ Options ▸ Agents ▸
++Let assistants connect (`ui.allowAssistants`, off by default) is on: then it opens one as
++`--control auto` does. Turning the setting on also opens the current window's channel, and saves
++the setting at once; turning it off leaves an open channel until the window closes.
++
+ ```sh
+ cat ~/.config/gridcraft/control-key.local-7979   # Linux, outside Flatpak, port 7979
+ ```
+@@ -76,6 +81,7 @@ drive an app on another machine, forward its port to `127.0.0.1` (for example
+ | `ui.backstage` (via `engine.execute`) | `{page?: home\|new\|open\|info\|saveAs\|print\|export\|options\|close}` | Open the File tab's Backstage view on a page, or close it (`ui.inspect` reports the open page as `backstage`) |
+ | `ui.screenshot` | `{path?}` | PNG of the window (base64 when no path). Animations are settled first: the picture shows the final state |
+ | `ui.set` | `{dark?, formulaBar?, ribbonCollapsed?, animations?}` | UI preferences (`formulaBar` runs `view.formulaBar`) |
++| `ui.allowAssistants` (via `engine.execute`) | `{on?: bool}` (`value` is an alias) | File ▸ Options ▸ Agents ▸ Let assistants connect; reads it without `on` → `{on}` |
+ | `ui.resize` / `ui.focus` | `{width, height}` | Window control |
+ | `app.open` / `app.save` / `app.quit` | `{path, password?}` / `{path?}` | Files and lifetime. `password` opens a password-protected workbook; without it, such a workbook returns an error (never a dialog) |
+ 
+-- 
+2.52.0.windows.1
+
