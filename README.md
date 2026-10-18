@@ -22,7 +22,7 @@ yourself, and safe to leave on.
 | `--control auto`: each window picks a free port | **added** | **added** | **added** |
 | "Let assistants connect to this window" setting (off by default) | **added** | **added** | **added** |
 | "Assistant connected" indicator in the status bar | **added** | **added** | **added** |
-| MCP `--automation-read-root` / `--automation-write-root` | already upstream | **added** | not yet |
+| MCP `--automation-read-root` / `--automation-write-root` | already upstream | **added** | **added** |
 
 - **Per-window key.** When a window opens its control channel it writes a random 256-bit key to
   `control-key.local-<port>` in the app's settings folder and removes it when the window
@@ -40,9 +40,15 @@ yourself, and safe to leave on.
   GridCraft, `app.allowAssistants` in DeckCraft).
 - **Indicator.** While at least one authenticated connection is open, the status bar shows
   "Assistant connected"; `ui.inspect` reports the count as `controlClients`.
-- **Automation roots for GridCraft.** `gridcraft-cli mcp` can be confined to a read folder and a
-  write folder, with WordCraft's semantics. DeckCraft 0.7.0 doesn't have them yet: upstream
-  added them later on top of an engine module that 0.7.0 doesn't include.
+- **Automation roots for GridCraft and DeckCraft.** `gridcraft-cli mcp` and `deckcraft-cli mcp`
+  take `--automation-read-root DIR` and `--automation-write-root DIR`, with WordCraft's
+  semantics: every file the agent's tools open, insert, save, export or render to must lie inside
+  the matching folder. Paths are made absolute with their links and junctions followed, `..`
+  that leaves a root is refused, a root left out grants no access of its kind, and combining the
+  roots with `--connect` is an error, since they can't confine a running app. Upstream DeckCraft
+  added the roots after 0.7.0 on top of an engine module 0.7.0 doesn't have; the DeckCraft patch
+  ports them to 0.7.0, with a small `io` module through which every named-file read and write
+  passes.
 
 User-interface text is in English only; the upstream translation catalogs are checked against
 each other in their tests.

@@ -1,7 +1,7 @@
 From c0a194f815cd75989ea2c1fb97494c7c0bfc824f Mon Sep 17 00:00:00 2001
 From: Lovelace's Square <noreply@lovelacesquare.org>
 Date: Sun, 18 Oct 2026 10:21:29 +0200
-Subject: [PATCH 3/4] Let assistants connect: a setting that opens every
+Subject: [PATCH 3/5] Let assistants connect: a setting that opens every
  window's control channel
 
 A window opened from the file manager has no control port, so an

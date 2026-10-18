@@ -1,7 +1,7 @@
 From b4dc18ea0e31560cc710bfa4e5f36761f5dd38c6 Mon Sep 17 00:00:00 2001
 From: Lovelace's Square <noreply@lovelacesquare.org>
 Date: Sun, 18 Oct 2026 10:19:58 +0200
-Subject: [PATCH 1/4] Control channel: every request needs the window's key
+Subject: [PATCH 1/5] Control channel: every request needs the window's key
 
 The loopback control port took commands from anything that could reach
 it: any local program, and a web page's fetch() to 127.0.0.1 could

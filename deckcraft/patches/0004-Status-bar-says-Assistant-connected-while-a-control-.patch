@@ -1,7 +1,7 @@
 From f287ede50a944dbf323798ec739ae1e41361efe0 Mon Sep 17 00:00:00 2001
 From: Lovelace's Square <noreply@lovelacesquare.org>
 Date: Sun, 18 Oct 2026 10:22:15 +0200
-Subject: [PATCH 4/4] Status bar says "Assistant connected" while a control
+Subject: [PATCH 4/5] Status bar says "Assistant connected" while a control
  connection is authorised
 
 With assistants allowed to join any window, the user should always see
